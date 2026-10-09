@@ -1,0 +1,41 @@
+{
+ "exe": "$STRATA_DIR/build-halo/strata",
+ "args": [
+  "--pack",
+  "$STRATA_DATA/packs/unsloth-ud-iq4_xs",
+  "--native",
+  "/srv/models/gguf/Qwen3.8-Flash-Next-UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf",
+  "--expert-profile",
+  "$STRATA_DIR/data/expert-profile.bin",
+  "--expert-cache",
+  "24576",
+  "--prefill",
+  "auto:16384",
+  "--spec",
+  "5",
+  "--spec-min-p",
+  "0.5",
+  "--mtp",
+  "$STRATA_DATA/mtp/rt",
+  "--max-context",
+  "262144",
+  "--kv",
+  "int8",
+  "--resident-budget-gib",
+  "55",
+  "--mtp-window",
+  "8192"
+ ],
+ "cwd": "$STRATA_DIR",
+ "tokenizer": "$STRATA_DATA/packs/unsloth-ud-iq4_xs/tokenizer",
+ "model_name": "Qwen/Qwen3.8-Flash-Next",
+ "log": "$STRATA_DIR/strata-service.log",
+ "lib_dirs": [
+  "$ROCM_SDK/lib",
+  "$ROCM_SDK/lib/rocm_sysdeps/lib",
+  "$ROCM_SDK/lib/llvm/lib"
+ ],
+ "port": 8000,
+ "backend": "hip",
+ "open_browser": false
+}

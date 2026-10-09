@@ -1,0 +1,97 @@
+From d27658eef8ba7b671dd977aa849cefb464fdf77c Mon Sep 17 00:00:00 2001
+From: Nathan Wilson <nath.flagman151@passmail.com>
+Date: Thu, 30 Jul 2026 01:23:34 +0000
+Subject: [PATCH 04/11] vulkan: store coopmat1 FA Psh query-major so the GEMM2
+ A load vectorizes
+
+Psh held P as [kv][query]. The GEMM2 UseA load therefore had to request
+ColumnMajor, and RADV only attaches an alignment hint to the internal
+column-major case, which for UseA means the RowMajor request. The load
+was emitted as 16 separate 16-bit shared reads per fragment.
+
+Store P as [query][kv] instead and request RowMajor. The producer now
+writes four scalar components rather than one vec4; those go to disjoint
+bytes, so there is no read-modify-write and no partially written vec4.
+
+Also updates the host shared-memory estimator, which mirrored the old
+stride and would otherwise disagree with the shader.
+
+Perf-neutral on gfx1151 (within 1% at hd128 and hd256), but it shrinks
+Psh: LDS 16384 -> 15360 B and code size 13896 -> 13596 at hd128, VGPRs
+unchanged at 96 with 0 spilled. Kept because it is free and removes a
+scalar shared-memory access pattern. FLASH_ATTN_EXT suite 5105/5105.
+
+Assisted-by: Claude Fable 5
+(cherry picked from commit 40f85eb859959d9416f601deef287275d354680f)
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp            |  4 ++--
+ .../vulkan-shaders/flash_attn_cm1.comp          | 17 ++++++++++++-----
+ 2 files changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 033c11741..2c031ce3d 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -8012,8 +8012,8 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
+     const uint32_t qstride = hsk_pad / 4 + 2;
+     const uint32_t Qf = Br * qstride * f16vec4;
+ 
+-    const uint32_t psh_stride = Br / 4 + 2;
+-    const uint32_t Psh = Bc * psh_stride * f16vec4;
++    const uint32_t psh_stride = Bc / 4 + 2;
++    const uint32_t Psh = Br * psh_stride * f16vec4;
+ 
+     const uint32_t sfshstride = (hsk <= 128) ? (Br + 8) : Br;
+     const uint32_t sfsh = Bc * sfshstride * acctype;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
+index f031a27d2..edb16ae7e 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
+@@ -44,8 +44,11 @@ shared float tmpsh[row_split];
+ const uint32_t qstride = HSK_pad / 4 + 2;
+ shared FLOAT_TYPEV4 Qf[Br * qstride];
+ 
+-const uint psh_stride = Br / 4 + 2;
+-shared FLOAT_TYPEV4 Psh[Bc * psh_stride];
++// P is stored query-major with KV contiguous so the GEMM2 UseA load can be RowMajor:
++// RADV flips the requested layout for UseA, and only the resulting internal column-major
++// case gets an alignment hint, which is what lets the 16 element loads vectorize.
++const uint psh_stride = Bc / 4 + 2;
++shared FLOAT_TYPEV4 Psh[Br * psh_stride];
+ 
+ // Avoid padding for hsk==256 to make it fit in 48KB shmem.
+ const uint32_t sfshstride = (HSK <= 128) ? (Br / 4 + 2) : Br / 4;
+@@ -395,15 +398,19 @@ void main() {
+ 
+             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; r += 4) {
+                 const uint row = tile_row(r);
++                const uint pcol_vec  = col / 4;
++                const uint pcol_comp = col % 4;
+                 if (KV_bounds_check && j * Bc + col >= KV) {
+-                    Psh[col * psh_stride + row / 4] = FLOAT_TYPEV4(0.0f);
++                    [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
++                        Psh[(row + vec_idx) * psh_stride + pcol_vec][pcol_comp] = FLOAT_TYPE(0.0f);
++                    }
+                 } else {
+                     const vec4 mfvec = vec4(Mf[r], Mf[r + 1], Mf[r + 2], Mf[r + 3]);
+                     const FLOAT_TYPEV4 Pf = FLOAT_TYPEV4(exp(vec4(sfsh[row / 4 + col * sfshstride]) - mfvec));
+                     [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
+                         Lf[r + vec_idx] += Pf[vec_idx];
++                        Psh[(row + vec_idx) * psh_stride + pcol_vec][pcol_comp] = Pf[vec_idx];
+                     }
+-                    Psh[col * psh_stride + row / 4] = Pf;
+                 }
+             }
+         }
+@@ -442,7 +449,7 @@ void main() {
+         // for every hsv_tile. Load them once instead of re-reading LDS per tile.
+         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> PMat[Bc / MatBc];
+         [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
+-            coopMatLoad(PMat[bc_chunk], Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
++            coopMatLoad(PMat[bc_chunk], Psh, bc_chunk * (MatBc / 4), psh_stride, gl_CooperativeMatrixLayoutRowMajor);
+         }
+ 
+         // Each subgroup handles HSV/4 columns
+-- 
+2.53.0
+

@@ -1,0 +1,91 @@
+From c17f7a5c24b1283de2ad1426b29c385fa6ad966b Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 11:53:51 -0400
+Subject: [PATCH 09/11] dflash: DFLASH_SWA drafter window; kv-cache: room for
+ the sparse key-bound tensor
+
+- DFLASH_SWA=<tokens> forces a sliding window on every DFlash draft layer. The Laguna drafter's GGUF has no window, so
+  each draft attended to the whole context and its acceptance collapsed with depth (0.2% at 31K). With a 1024 window:
+  ~70% at 31K; with LLAMA_SPEC_ADAPTIVE=1.5, code generation +22-33% from ~1K to 124K, prose about neutral.
+- The KV-cache ggml context was sized for K and V only; with LLAMA_SPARSE_ATTN the per-layer ks tensor overflowed it
+  for a cache with no spare slots (a 6-layer DFlash drafter) and the server aborted at start. Reserve one more tensor
+  per layer.
+- test-backend-ops: sparse FA, top_k (k=64) and the bound softmax with 5-token (speculative verify) batches.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-kv-cache.cpp     |  2 +-
+ src/models/dflash.cpp      | 14 ++++++++++++++
+ tests/test-backend-ops.cpp |  4 +++-
+ 3 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 7a3e42586..96adfdc53 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -114,7 +114,7 @@ llama_kv_cache::llama_kv_cache(
+         auto it = ctx_map.find(buft);
+         if (it == ctx_map.end()) {
+             ggml_init_params params = {
+-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
++                /*.mem_size   =*/ size_t((2u*(1 + n_stream) + 1)*n_layer*ggml_tensor_overhead()), // +1: sparse key bounds (ks)
+                 /*.mem_buffer =*/ NULL,
+                 /*.no_alloc   =*/ true,
+             };
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index 717b47d28..a1a0c404d 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -120,6 +120,20 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
+         hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+     }
+ 
++    // DFLASH_SWA=<tokens>: force a sliding window on every draft layer. A drafter trained with full attention still
++    // mostly needs recent context; without a window each draft step attends to the whole target context, which at
++    // 100K+ tokens costs as much as a target token and erases the speculation gain.
++    if (const char * e = getenv("DFLASH_SWA"); e && atoi(e) > 0 && hparams.swa_type == LLAMA_SWA_TYPE_NONE) {
++        hparams.n_swa    = (uint32_t) atoi(e);
++        hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
++        hparams.set_swa_pattern(0);
++        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
++            hparams.is_swa_impl[il] = true;
++        }
++        hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
++        hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
++    }
++
+     type = LLM_TYPE_UNKNOWN;
+ }
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index ffa16b225..5719db5ed 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10616,6 +10616,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     // block-sparse selection (LLAMA_SPARSE_ATTN): per-block bound softmax, 2-D mask broadcast over 48 heads
+     for (int64_t nb : {500, 940, 1272, 2000}) {
+         test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {nb, 1, 1, 1}, true, false, GGML_TYPE_F32, {48, 1}, 0.0884f, 0.0f));
++        test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {nb, 5, 1, 1}, true, false, GGML_TYPE_F32, {48, 1}, 0.0884f, 0.0f));
+     }
+ 
+ #if 0
+@@ -10866,6 +10867,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     for (int64_t nb : {500, 1024, 1272, 2000, 2048, 3072}) {
+         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {nb, 1, 1, 1}, 64));
+         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {nb, 1, 1, 1}, 64, true));
++        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {nb, 5, 1, 1}, 64)); // speculative verify batches
+     }
+ 
+     // Large-k, including multi-row and ties (qwen4exp)
+@@ -11114,7 +11116,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {9, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+     // block-sparse decode on a q8_0 cache (LLAMA_SPARSE_ATTN): n_kv_max finite mask entries
+-    for (int64_t kv : { 16384, 32768, 46080, 81920, 131072 }) for (int64_t nb : { 1, 2 }) {
++    for (int64_t kv : { 16384, 32768, 46080, 81920, 131072 }) for (int64_t nb : { 1, 2, 5 }) {
+         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 4096));
+         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0));
+     }
+-- 
+2.53.0
+

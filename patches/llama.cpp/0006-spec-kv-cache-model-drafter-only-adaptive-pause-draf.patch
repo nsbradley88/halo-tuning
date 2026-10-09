@@ -1,0 +1,145 @@
+From adbec7bba984b6060554c645471f055c7c1c956e Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 04:49:43 -0400
+Subject: [PATCH 06/11] spec, kv-cache: model-drafter-only adaptive pause,
+ drafter context cap, per-side attention rotation knobs
+
+- common/speculative: the adaptive pause and its acceptance tracking apply only to model drafters
+  (is_model_draft_type), so n-gram drafters are never paused; LLAMA_SPEC_MODEL_MAX_CTX stops model
+  drafting past a context size.
+- kv-cache: LLAMA_ATTN_ROT_K_DISABLE / LLAMA_ATTN_ROT_V_DISABLE turn off the attention rotation for one
+  side only (LLAMA_ATTN_ROT_DISABLE still turns off both).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp | 48 +++++++++++++++++++++++++++++++++++++-----
+ src/llama-kv-cache.cpp |  8 +++++++
+ 2 files changed, 51 insertions(+), 5 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 4afea356a..017b9e7a3 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2186,6 +2186,9 @@ struct common_speculative {
+         int   backoff  = 8;
+     };
+     float                    adapt_min = 0.0f;
++    // LLAMA_SPEC_MODEL_MAX_CTX=<tokens>: model-based drafts (DFlash etc.) stop above this context length, where their
++    // acceptance has collapsed; n-gram drafts keep running. 0 = no limit.
++    int64_t                  model_max_ctx = 0;
+     std::vector<adapt_state> adapt;
+ 
+     void adapt_update(llama_seq_id seq_id, float n_accepted) {
+@@ -2752,6 +2755,12 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+             LOG_INF("%s: adaptive speculation: pause drafting below %.2f accepted tokens per round\n", __func__, result->adapt_min);
+         }
+     }
++    if (const char * e = getenv("LLAMA_SPEC_MODEL_MAX_CTX")) {
++        result->model_max_ctx = std::max<int64_t>(0, atoll(e));
++        if (result->model_max_ctx > 0) {
++            LOG_INF("%s: model-based drafts limited to context <= %lld tokens\n", __func__, (long long) result->model_max_ctx);
++        }
++    }
+ 
+     const int32_t n_max_configured = common_speculative_n_max(&params);
+     const int32_t n_max_effective  = common_speculative_n_max(result.get());
+@@ -2824,6 +2833,12 @@ bool common_speculative_process(common_speculative * spec, const common_batch &
+     return result;
+ }
+ 
++static bool is_model_draft_type(common_speculative_type t) {
++    return t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
++           t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP    || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
++           t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
++}
++
+ void common_speculative_draft(common_speculative * spec) {
+     if (spec == nullptr) {
+         return;
+@@ -2831,15 +2846,16 @@ void common_speculative_draft(common_speculative * spec) {
+ 
+     auto & dparams = spec->dparams;
+ 
+-    // adaptive speculation: sequences in a pause do not draft this step
++    // adaptive speculation: sequences in a pause skip the model-based drafts this step (n-gram drafts are free and
++    // still run). attempted = a model-based draft pass was paid for.
++    std::vector<char> paused(dparams.size(), 0);
+     std::vector<char> attempted(dparams.size(), 0);
+     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+         auto & dp = dparams[seq_id];
+         if (dp.drafting && spec->adapt_min > 0.0f && (size_t) seq_id < spec->adapt.size() && spec->adapt[seq_id].cooldown > 0) {
+             spec->adapt[seq_id].cooldown--;
+-            dp.drafting = false;
++            paused[seq_id] = 1;
+         }
+-        attempted[seq_id] = dp.drafting;
+     }
+ 
+     {
+@@ -2859,11 +2875,31 @@ void common_speculative_draft(common_speculative * spec) {
+     }
+ 
+     for (auto & impl : spec->impls) {
+-        {
++        const bool model_based = is_model_draft_type(impl->type);
++        // paused sequences sit out the model-based drafts
++        std::vector<char> held(dparams.size(), 0);
++        int n_run = 0;
++        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
++            auto & dp = dparams[seq_id];
++            if (model_based && dp.drafting && (paused[seq_id] || (spec->model_max_ctx > 0 && (int64_t) dp.prompt->size() > spec->model_max_ctx))) {
++                held[seq_id]  = 1;
++                dp.drafting   = false;
++            }
++            if (model_based && dp.drafting) {
++                attempted[seq_id] = 1;
++            }
++            n_run += dp.drafting;
++        }
++        if (n_run > 0) {
+             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
+             impl->draft(dparams);
+             impl->n_call_draft++;
+         }
++        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
++            if (held[seq_id]) {
++                dparams[seq_id].drafting = true;
++            }
++        }
+ 
+         int n_drafting = 0;
+ 
+@@ -2932,7 +2968,9 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+         return;
+     }
+ 
+-    spec->adapt_update(seq_id, (float) n_accepted);
++    if (is_model_draft_type(impl->type)) {
++        spec->adapt_update(seq_id, (float) n_accepted);
++    }
+ 
+     {
+         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 1d0554fa1..900c915ed 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -331,7 +331,15 @@ llama_kv_cache::llama_kv_cache(
+             attn_rot_k = true;
+         }
+ 
++        // LLAMA_ATTN_ROT_K_DISABLE / LLAMA_ATTN_ROT_V_DISABLE turn off one side only
++        const char * rot_k_off = getenv("LLAMA_ATTN_ROT_K_DISABLE");
++        const char * rot_v_off = getenv("LLAMA_ATTN_ROT_V_DISABLE");
++        if (rot_k_off && atoi(rot_k_off)) {
++            attn_rot_k = false;
++        }
++
+         attn_rot_v =
++            !(rot_v_off && atoi(rot_v_off)) &&
+             !attn_rot_disable &&
+             n_embd_head_v_all > 0 &&
+             ggml_is_quantized(type_v) &&
+-- 
+2.53.0
+

@@ -1,0 +1,39 @@
+From a373bf8d265bb3824b690270109a6196d3f26eca Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 18:03:27 -0400
+Subject: [PATCH 11/11] vulkan: cap the FA KV-slice count to the split_k
+ scratch limit
+
+GGML_VK_FA_KV_SLICE keeps an O/m/L partial per slice, row and head. With
+many heads and a large ubatch the scratch exceeded maxStorageBufferRange
+(MiMo-V2.6: 64 heads, ub 4096, slice 4096 at 128K context = 4.6 GB) and
+the backend aborted with "Requested preallocation size is too large".
+Clamp the slice count so the scratch fits, widening the slices instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 3191c642c..ca11392d3 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -8334,8 +8334,12 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+         // before the next (split index outermost), so concurrently running workgroups share a cache-sized slice of K/V
+         const uint32_t kv_slice = (uint32_t) std::max(0, ggml_vk_env_int("GGML_VK_FA_KV_SLICE", 0));
+         if (kv_slice > 0 && N > 8 && KV >= 2 * kv_slice) {
+-            split_k = std::max(split_k, CEIL_DIV(KV, kv_slice));
+-            fa_split_outer = true;
++            // each slice keeps an O / m / L partial per row and head; cap the slice count so the split_k
++            // scratch stays under maxStorageBufferRange (many heads x large ubatch), widening the slices instead
++            const uint64_t per_split = (HSV * ne1 * sizeof(float) + ne1 * sizeof(float) * 2) * ne2 * ne3;
++            const uint32_t max_split = (uint32_t) std::max<uint64_t>(1, ctx->device->properties.limits.maxStorageBufferRange / per_split);
++            split_k = std::max(split_k, std::min(CEIL_DIV(KV, kv_slice), max_split));
++            fa_split_outer = split_k > 1;
+         }
+     }
+ 
+-- 
+2.53.0
+

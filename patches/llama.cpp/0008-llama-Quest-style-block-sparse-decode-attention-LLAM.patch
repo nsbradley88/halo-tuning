@@ -1,0 +1,488 @@
+From 8be6a103fce4bebf8c5e651102fb8be26bea1116 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 04:50:06 -0400
+Subject: [PATCH 08/11] llama: Quest-style block-sparse decode attention
+ (LLAMA_SPARSE_ATTN)
+
+LLAMA_SPARSE_ATTN=k,bs,min_ctx[,sink,recent] (non-SWA layers of a single-stream unified cache, no MLA):
+decode ubatches (<= 8 tokens) at n_kv >= min_ctx attend only to the top-k blocks of bs cells per token.
+
+- Per block and KV head the cache keeps the elementwise max and min of the keys (ks, F32
+  [2*hd, kv_size/bs, n_head_kv]). The bound relu(q).max - relu(-q).min is one mul_mat; per-head softmax
+  over blocks, summed over heads, with sink (first 128 tokens) and recent (last 1024) blocks forced and
+  empty blocks excluded, then top_k. The selection becomes the attention mask and FA runs with the
+  n_kv_max sparse hint.
+- The bounds are refreshed on the host after each ubatch (llama_kv_cache::sparse_host_update): prompt
+  ubatches refresh every block they touched, decode only a block whose last cell was written (a partly
+  written block is always among the forced recent blocks). Refreshing them inside the forward graph on
+  Vulkan corrupted the forward pass at depth (single-token NaN out of a full-attention layer past ~30K),
+  which no backend switch (fusion, graph optimize, barriers, submit batching) avoided.
+- The selection bias input scans only sink and tail blocks per token, keeping the host cost independent
+  of n_kv; graph reuse checks the sparse/dense choice and block count.
+
+Laguna-S-2.1, q8_0 KV, Strix Halo, LLAMA_SPARSE_ATTN=64,64,16384: decode 19.5 -> 26.4 tok/s at 128K,
+15.0 -> 24.2 at 245K; needle 15/15 at 81K; greedy output at 128K equivalent to dense.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp  |   9 ++
+ src/llama-graph.cpp    |  70 ++++++++++++++-
+ src/llama-graph.h      |   3 +
+ src/llama-kv-cache.cpp | 198 ++++++++++++++++++++++++++++++++++++++++-
+ src/llama-kv-cache.h   |  36 ++++++++
+ 5 files changed, 313 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 4f04db0ee..8dc372dc9 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-context.h"
++#include "llama-kv-cache-iswa.h"
+ 
+ #include "ggml.h"
+ #include "llama-arch.h"
+@@ -1467,6 +1468,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ 
+     ret = GGML_STATUS_SUCCESS;
+ 
++    // sparse decode attention: refresh the per-block key bounds of the cells this ubatch wrote
++    if (auto * iswa_ctx = dynamic_cast<const llama_kv_cache_iswa_context *>(mctx)) {
++        if (iswa_ctx->get_base()->get_kv()->get_sparse().k > 0 && iswa_ctx->get_base()->sparse_host_pending()) {
++            ggml_backend_sched_synchronize(sched.get());
++            iswa_ctx->get_base()->sparse_host_update();
++        }
++    }
++
+     return res;
+ }
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index ae477c08d..b998422c4 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -655,6 +655,10 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
+     if (self_v_rot_swa && self_v_rot_swa->buffer) {
+         mctx->get_swa()->set_input_v_rot(self_v_rot_swa);
+     }
++
++    if (sp_bias && sp_bias->buffer) {
++        mctx->get_base()->set_input_sp_bias(sp_bias, nullptr, ubatch);
++    }
+ }
+ 
+ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
+@@ -684,6 +688,16 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
+         res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
+     }
+ 
++    if (mctx->get_base()->get_kv()->get_sparse().k > 0) {
++        const auto * kvb = mctx->get_base()->get_kv();
++        // the sparse/dense choice and the block count must match
++        res &= (sp_bias != nullptr) == mctx->get_base()->sparse_active(params.ubatch.n_tokens);
++        if (sp_bias) {
++            res &= sp_bias->ne[0] == (int64_t) (mctx->get_base()->get_n_kv() / kvb->get_sparse().bs);
++            res &= sp_bias->ne[1] == (int64_t) params.ubatch.n_tokens;
++        }
++    }
++
+     return res;
+ }
+ 
+@@ -3179,6 +3193,10 @@ ggml_tensor * llm_graph_context::build_attn(
+         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
+ 
+         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
++
++        // sparse decode attention: the per-block key bounds are refreshed on the host after the ubatch
++        // (llama_kv_cache::sparse_host_update); refreshing them in this graph corrupted the forward pass
++        // on Vulkan at depth (a single-token NaN out of a full-attention layer)
+     }
+ 
+     if (store_kv && v_cur) {
+@@ -3187,13 +3205,55 @@ ggml_tensor * llm_graph_context::build_attn(
+         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+     }
+ 
+-    const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
++    ggml_tensor * kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
+ 
+     ggml_tensor * q = q_cur;
+     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
++    int64_t n_kv_max = 0;
++    if (!is_swa && inp->sp_bias) {
++        // Quest-style block selection: upper bound of q.k per block from the per-block key max/min,
++        // softmax per head over blocks, summed over all heads, top-k blocks (+ forced sink / recent blocks)
++        const auto & sp   = mctx_iswa->get_base()->get_kv()->get_sparse();
++        const int64_t bs    = sp.bs;
++        const int64_t n_kv  = kq_mask->ne[0];
++        const int64_t n_blk = n_kv / bs;
++        const int64_t n_tok = q_cur->ne[2];
++        const int64_t n_hd  = q_cur->ne[1];
++
++        ggml_tensor * ksv = mctx_iswa->get_base()->get_ks(ctx0, il);                // [2*hd, n_blk, n_head_kv]
++        GGML_ASSERT(ksv->ne[1] == n_blk);
++
++        ggml_tensor * qp = ggml_relu(ctx0, q_cur);
++        ggml_tensor * qn = ggml_neg(ctx0, ggml_relu(ctx0, ggml_neg(ctx0, q_cur)));
++        ggml_tensor * q2 = ggml_concat(ctx0, qp, qn, 0);                       // [2*hd, n_head, n_tok]
++        q2 = ggml_cont(ctx0, ggml_permute(ctx0, q2, 0, 2, 1, 3));              // [2*hd, n_tok, n_head]
++
++        ggml_tensor * ub = ggml_mul_mat(ctx0, ksv, q2);                        // [n_blk, n_tok, n_head]
++
++        ggml_tensor * bias_pre  = ggml_view_2d(ctx0, inp->sp_bias, n_blk, n_tok, inp->sp_bias->nb[1], 0);
++        ggml_tensor * bias_post = ggml_view_2d(ctx0, inp->sp_bias, n_blk, n_tok, inp->sp_bias->nb[1], inp->sp_bias->nb[2]);
++
++        ggml_tensor * pb = ggml_soft_max_ext(ctx0, ub, bias_pre, kq_scale, 0.0f);
++        pb = ggml_cont(ctx0, ggml_permute(ctx0, pb, 1, 2, 0, 3));              // [n_head, n_blk, n_tok]
++        pb = ggml_sum_rows(ctx0, pb);                                           // [1, n_blk, n_tok]
++        pb = ggml_reshape_2d(ctx0, pb, n_blk, n_tok);
++        pb = ggml_add(ctx0, pb, bias_post);
++
++        ggml_tensor * top = ggml_top_k(ctx0, pb, sp.k);                        // I32 [k, n_tok]
++
++        ggml_tensor * m_all = ggml_fill(ctx0, kq_mask, -INFINITY);
++        ggml_tensor * m_blk = ggml_view_3d(ctx0, m_all, bs, n_blk, n_tok, bs*ggml_element_size(m_all), m_all->nb[1], 0);
++        ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, bs, sp.k, n_tok), 0.0f);
++        ggml_tensor * m_sel = ggml_set_rows(ctx0, m_blk, zeros, top);
++        m_sel = ggml_view_2d(ctx0, m_sel, n_kv, n_tok, m_all->nb[1], 0);
++        kq_mask = ggml_add(ctx0, m_sel, kq_mask);
++        n_kv_max = (int64_t) sp.k * bs;
++        GGML_UNUSED(n_hd);
++    }
++
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, n_kv_max, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (v_rot) {
+@@ -3459,6 +3519,12 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
+     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
+     inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
+ 
++    if (mctx_cur->get_base()->get_kv()->get_sparse().k > 0) {
++        if (mctx_cur->get_base()->sparse_active(ubatch.n_tokens)) {
++            inp->sp_bias = mctx_cur->get_base()->build_input_sp_bias(ctx0, ubatch);
++        }
++    }
++
+     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
+ }
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 3daa425bc..b4b5d0d2a 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -522,6 +522,9 @@ public:
+     ggml_tensor * self_k_rot_swa = nullptr;
+     ggml_tensor * self_v_rot_swa = nullptr;
+ 
++    // sparse decode attention on the full-attention cache (LLAMA_SPARSE_ATTN)
++    ggml_tensor * sp_bias   = nullptr; // F32 [n_blk, n_tokens, 2] (only when sparse attention runs)
++
+     const llama_hparams hparams;
+     const llama_cparams cparams;
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 900c915ed..7a3e42586 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -162,6 +162,19 @@ llama_kv_cache::llama_kv_cache(
+ 
+     const bool is_mla = hparams.is_mla();
+ 
++    // sparse decode attention for the full-attention (non-SWA) cache only
++    if (const char * e = getenv("LLAMA_SPARSE_ATTN"); e && swa_type == LLAMA_SWA_TYPE_NONE && !is_mla && n_stream == 1 && other == nullptr) {
++        int v[5] = { 0, 64, 16384, 128, 1024 };
++        sscanf(e, "%d,%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3], &v[4]);
++        if (v[0] > 0 && v[1] > 0 && 256 % v[1] == 0 && kv_size % v[1] == 0) {
++            sparse.k = v[0]; sparse.bs = v[1]; sparse.min_ctx = v[2]; sparse.sink = v[3]; sparse.recent = v[4];
++            LLAMA_LOG_INFO("%s: sparse decode attention: %d blocks of %d cells per query from n_kv >= %d (sink %d, recent %d)\n",
++                    __func__, sparse.k, sparse.bs, sparse.min_ctx, sparse.sink, sparse.recent);
++        } else {
++            LLAMA_LOG_WARN("%s: LLAMA_SPARSE_ATTN='%s' ignored (block size must divide 256 and the cache size)\n", __func__, e);
++        }
++    }
++
+     for (uint32_t il = 0; il < n_layer; il++) {
+         if (!hparams.has_kv(il)) {
+             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
+@@ -246,7 +259,14 @@ llama_kv_cache::llama_kv_cache(
+ 
+         map_layer_ids[il] = layers.size();
+ 
+-        layers.push_back({ il, k, v, k_stream, v_stream, });
++        ggml_tensor * ks = nullptr;
++        if (sparse.k > 0) {
++            const uint32_t hd = hparams.n_embd_head_k(il);
++            ks = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*hd, kv_size / sparse.bs, n_embd_k_gqa / hd);
++            ggml_format_name(ks, "cache_%sks_l%d", name_tag, il);
++        }
++
++        layers.push_back({ il, k, v, k_stream, v_stream, ks, });
+     }
+ 
+     if (reuse) {
+@@ -1281,6 +1301,158 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+     return result;
+ }
+ 
++bool llama_kv_cache::sparse_active(uint32_t n_tokens, uint32_t n_kv) const {
++    return sparse.k > 0 && n_tokens <= 8 && (int32_t) n_kv >= sparse.min_ctx && (int32_t) (n_kv / sparse.bs) >= 4 * sparse.k;
++}
++
++ggml_tensor * llama_kv_cache::get_ks(ggml_context * ctx, int32_t il, uint32_t n_kv) const {
++    const int32_t ikv = map_layer_ids.at(il);
++    ggml_tensor * ks = layers[ikv].ks;
++    GGML_ASSERT(ks != nullptr);
++    return ggml_view_3d(ctx, ks, ks->ne[0], n_kv / sparse.bs, ks->ne[2], ks->nb[1], ks->nb[2], 0);
++}
++
++ggml_tensor * llama_kv_cache::build_input_sp_bias(ggml_context * ctx, const llama_ubatch & ubatch, uint32_t n_kv) const {
++    // [n_blk, n_tokens, 2]: plane 0 = softmax bias (0 / -inf for empty blocks), plane 1 = selection bias (+1e4 forced)
++    ggml_tensor * t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_kv / sparse.bs, ubatch.n_tokens, 2);
++    ggml_set_input(t);
++    ggml_set_name(t, "attn_inp_sp_bias");
++    return t;
++}
++
++void llama_kv_cache::set_input_sp_bias(ggml_tensor * pre, ggml_tensor * post, const llama_ubatch * ubatch, const slot_info & sinfo) const {
++    GGML_ASSERT(ggml_backend_buffer_is_host(pre->buffer));
++    GGML_UNUSED(post);
++    float * d = (float *) pre->data;
++
++    const auto & cells = v_cells[sinfo.strm[0]];
++    const int64_t n_blk    = pre->ne[0];
++    const int64_t n_tokens = pre->ne[1];
++    const int64_t bs       = sparse.bs;
++
++    llama_pos pos_max = -1;
++    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
++        pos_max = std::max(pos_max, ubatch->pos[i]);
++    }
++
++    // Exact per-cell scans only where they matter (the sink blocks and the blocks near the end of the used range);
++    // the blocks in between are treated as occupied and not forced. This keeps the host cost independent of n_kv;
++    // the dense mask still hides any empty cell inside a selected block, so this only affects which blocks are picked.
++    const int64_t used_end = cells.used_max_p1();
++    const int64_t n_sink_b = (sparse.sink + bs - 1) / bs;
++    const int64_t n_tail_b = (sparse.recent + bs - 1) / bs + 2;
++    const int64_t tail_b0  = std::max<int64_t>(0, (used_end + bs - 1) / bs - n_tail_b);
++
++    auto put = [&](int64_t b, bool empty, bool forced) {
++        for (int64_t t = 0; t < n_tokens; ++t) {
++            d[0*n_blk*n_tokens + t*n_blk + b] = empty ? -INFINITY : 0.0f;
++            d[1*n_blk*n_tokens + t*n_blk + b] = empty ? -1e30f : (forced ? 1e4f : 0.0f);
++        }
++    };
++    auto scan = [&](int64_t b) {
++        llama_pos pmin = std::numeric_limits<llama_pos>::max(), pmax = -1;
++        for (int64_t c = b*bs; c < (b + 1)*bs && c < used_end; ++c) {
++            if (!cells.is_empty(c)) {
++                const llama_pos p = cells.pos_get(c);
++                pmin = std::min(pmin, p);
++                pmax = std::max(pmax, p);
++            }
++        }
++        const bool empty = pmax < 0;
++        put(b, empty, !empty && (pmin < sparse.sink || pmax > pos_max - sparse.recent));
++    };
++
++    for (int64_t b = 0; b < n_blk; ++b) {
++        if (b*bs >= used_end) {
++            put(b, true, false);
++        } else if (b < n_sink_b || b >= tail_b0) {
++            scan(b);
++        } else {
++            put(b, false, false);
++        }
++    }
++
++}
++
++std::vector<int64_t> llama_kv_cache::sparse_host_blocks(const slot_info & sinfo) const {
++    // blocks whose bounds need a refresh after this ubatch. A small (decode) ubatch only refreshes the blocks it
++    // completes: a partly written block is always among the forced recent blocks, so its bounds are not read until
++    // it is full. Larger ubatches (prompt processing) refresh every block they touch.
++    std::vector<int64_t> blk;
++    if (sparse.k <= 0) {
++        return blk;
++    }
++    const int64_t bs = sparse.bs;
++    const bool small = sinfo.size() <= 8;
++    for (uint32_t i = 0; i < sinfo.size(); ++i) {
++        const int64_t c = sinfo.idxs[0][i];
++        if (small && c % bs != bs - 1) {
++            continue;
++        }
++        const int64_t b = c / bs;
++        if (std::find(blk.begin(), blk.end(), b) == blk.end()) {
++            blk.push_back(b);
++        }
++    }
++    return blk;
++}
++
++void llama_kv_cache::sparse_host_update(const slot_info & sinfo) const {
++    if (sparse.k <= 0) {
++        return;
++    }
++    const int64_t bs = sparse.bs;
++
++    std::vector<int64_t> blk = sparse_host_blocks(sinfo);
++    if (blk.empty()) {
++        return;
++    }
++
++    std::vector<uint8_t> raw;
++    std::vector<float>   val;
++    std::vector<float>   out;
++    for (const auto & layer : layers) {
++        ggml_tensor * k  = layer.k;
++        ggml_tensor * ks = layer.ks;
++        if (!ks) {
++            continue;
++        }
++        const int64_t n_embd = k->ne[0];             // n_embd_head_k * n_head_kv
++        const int64_t hd     = ks->ne[0] / 2;
++        const int64_t n_hkv  = ks->ne[2];
++        const size_t  rsz    = ggml_row_size(k->type, n_embd);
++        const auto  * tt     = ggml_get_type_traits(k->type);
++
++        raw.resize(bs*rsz);
++        val.resize(bs*n_embd);
++        out.resize(2*hd*n_hkv);
++        for (int64_t b : blk) {
++            ggml_backend_tensor_get(k, raw.data(), b*bs*k->nb[1], bs*rsz);
++            for (int64_t c = 0; c < bs; ++c) {
++                if (k->type == GGML_TYPE_F32) {
++                    memcpy(val.data() + c*n_embd, raw.data() + c*rsz, rsz);
++                } else {
++                    tt->to_float(raw.data() + c*rsz, val.data() + c*n_embd, n_embd);
++                }
++            }
++            for (int64_t h = 0; h < n_hkv; ++h) {
++                for (int64_t d = 0; d < hd; ++d) {
++                    float mx = -INFINITY, mn = INFINITY;
++                    for (int64_t c = 0; c < bs; ++c) {
++                        const float x = val[c*n_embd + h*hd + d];
++                        mx = std::max(mx, x);
++                        mn = std::min(mn, x);
++                    }
++                    out[h*2*hd + d]      = mx;
++                    out[h*2*hd + hd + d] = mn;
++                }
++            }
++            // ks is [2*hd, kv_size/bs, n_hkv]: one 2*hd row per head, heads strided by nb[2]
++            ggml_backend_tensor_set_2d(ks, out.data(), b*ks->nb[1], 2*hd*sizeof(float), n_hkv, ks->nb[2], 2*hd*sizeof(float));
++        }
++    }
++}
++
+ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+     const int32_t ikv = map_layer_ids.at(il);
+ 
+@@ -2869,6 +3041,30 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
+     return n_kv;
+ }
+ 
++bool llama_kv_cache_context::sparse_active(uint32_t n_tokens) const {
++    return kv->sparse_active(n_tokens, n_kv);
++}
++
++bool llama_kv_cache_context::sparse_host_pending() const {
++    return !kv->sparse_host_blocks(sinfos[i_cur]).empty();
++}
++
++void llama_kv_cache_context::sparse_host_update() const {
++    kv->sparse_host_update(sinfos[i_cur]);
++}
++
++ggml_tensor * llama_kv_cache_context::get_ks(ggml_context * ctx, int32_t il) const {
++    return kv->get_ks(ctx, il, n_kv);
++}
++
++ggml_tensor * llama_kv_cache_context::build_input_sp_bias(ggml_context * ctx, const llama_ubatch & ubatch) const {
++    return kv->build_input_sp_bias(ctx, ubatch, n_kv);
++}
++
++void llama_kv_cache_context::set_input_sp_bias(ggml_tensor * pre, ggml_tensor * post, const llama_ubatch * ubatch) const {
++    kv->set_input_sp_bias(pre, post, ubatch, sinfos[i_cur]);
++}
++
+ ggml_type llama_kv_cache_context::type_k() const {
+     return kv->type_k();
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 52cc8cd32..a2407ba44 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -192,6 +192,28 @@ public:
+ 
+     uint32_t get_n_kv(const slot_info & sinfo) const;
+ 
++    // sparse decode attention (Quest-style block selection), LLAMA_SPARSE_ATTN=k,bs,min_ctx[,sink,recent]
++    struct sparse_params {
++        int32_t k       = 0;      // selected blocks per query (0: off)
++        int32_t bs      = 64;     // cells per block
++        int32_t min_ctx = 16384;  // use sparse attention from this n_kv
++        int32_t sink    = 128;    // always keep blocks holding positions < sink
++        int32_t recent  = 1024;   // always keep blocks holding positions > pos_max - recent
++    };
++    const sparse_params & get_sparse() const { return sparse; }
++    bool sparse_active(uint32_t n_tokens, uint32_t n_kv) const;
++
++    ggml_tensor * get_ks(ggml_context * ctx, int32_t il, uint32_t n_kv) const;
++
++    ggml_tensor * build_input_sp_bias  (ggml_context * ctx, const llama_ubatch & ubatch, uint32_t n_kv) const;
++
++    void set_input_sp_bias(ggml_tensor * pre, ggml_tensor * post, const llama_ubatch * ubatch, const slot_info & sinfo) const;
++
++    // sparse decode attention: recompute the key bounds of the blocks this ubatch wrote (host side, after the
++    // graph has completed)
++    void sparse_host_update(const slot_info & sinfo) const;
++    std::vector<int64_t> sparse_host_blocks(const slot_info & sinfo) const;
++
+     // get views of the current state of the cache
+     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+@@ -264,6 +286,9 @@ private:
+ 
+         std::vector<ggml_tensor *> k_stream;
+         std::vector<ggml_tensor *> v_stream;
++
++        // sparse decode attention: per-block key bounds [2*n_embd_head_k (max | min), kv_size/bs, n_head_kv], F32
++        ggml_tensor * ks = nullptr;
+     };
+ 
+     bool v_trans = true;  // the value tensor is transposed
+@@ -295,6 +320,8 @@ private:
+     // this is the SWA type of the cache - not to be confused with the model SWA type
+     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
+ 
++    sparse_params sparse;
++
+     // ggml contexts for the KV cache along with the allocated backend buffers:
+     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+ 
+@@ -400,6 +427,15 @@ public:
+ 
+     uint32_t get_n_kv() const;
+ 
++    // sparse decode attention
++    bool sparse_active(uint32_t n_tokens) const;
++    const llama_kv_cache * get_kv() const { return kv; }
++    ggml_tensor * get_ks(ggml_context * ctx, int32_t il) const;
++    ggml_tensor * build_input_sp_bias  (ggml_context * ctx, const llama_ubatch & ubatch) const;
++    void set_input_sp_bias(ggml_tensor * pre, ggml_tensor * post, const llama_ubatch * ubatch) const;
++    bool sparse_host_pending() const;
++    void sparse_host_update() const;
++
+     ggml_type type_k() const;
+     ggml_type type_v() const;
+ 
+-- 
+2.53.0
+

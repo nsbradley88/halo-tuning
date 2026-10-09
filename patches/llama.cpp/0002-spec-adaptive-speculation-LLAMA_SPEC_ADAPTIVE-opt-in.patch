@@ -1,0 +1,141 @@
+From d9f63d220e8dda7cbf77d4ecfae70d3aeec4b2ff Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 05:10:17 -0400
+Subject: [PATCH 02/11] spec: adaptive speculation (LLAMA_SPEC_ADAPTIVE);
+ opt-in GPU input layer for full offload (LLAMA_OFFLOAD_INPUT); DFlash debug
+ toggles
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp | 53 ++++++++++++++++++++++++++++++++++++++++++
+ src/llama-model.cpp    |  7 +++++-
+ src/models/dflash.cpp  |  2 +-
+ 3 files changed, 60 insertions(+), 2 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 381052af2..4afea356a 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2174,6 +2174,34 @@ struct common_speculative {
+     std::vector<common_speculative_impl *> impl_last;
+ 
+     std::vector<double> synth_probs;
++
++    // adaptive speculation (LLAMA_SPEC_ADAPTIVE=<min accepted tokens per round>, e.g. 1.0; unset = off): per sequence,
++    // an EMA of accepted tokens per drafting round. When it falls below the threshold, drafting pauses for `backoff`
++    // steps (doubling on repeated failures up to 256, halving back on success). The target still feeds every batch to
++    // the drafts through process(), so a paused draft resumes with its context intact. On bandwidth-bound MoE targets a
++    // verify window costs well over one plain step, so a draft that is not accepted makes generation slower than none.
++    struct adapt_state {
++        float ema      = 2.0f;
++        int   cooldown = 0;
++        int   backoff  = 8;
++    };
++    float                    adapt_min = 0.0f;
++    std::vector<adapt_state> adapt;
++
++    void adapt_update(llama_seq_id seq_id, float n_accepted) {
++        if (adapt_min <= 0.0f || seq_id < 0 || (size_t) seq_id >= adapt.size()) {
++            return;
++        }
++        auto & a = adapt[seq_id];
++        a.ema = 0.7f * a.ema + 0.3f * n_accepted;
++        if (a.ema < adapt_min) {
++            a.cooldown = a.backoff;
++            a.backoff  = std::min(a.backoff * 2, 256);
++            a.ema      = adapt_min; // the probe after the pause starts at break-even
++        } else {
++            a.backoff  = std::max(a.backoff / 2, 8);
++        }
++    }
+ };
+ 
+ static common_ngram_map get_common_ngram_map(
+@@ -2717,6 +2745,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+         /* .synth_probs = */ {},
+     });
+ 
++    if (const char * e = getenv("LLAMA_SPEC_ADAPTIVE")) {
++        result->adapt_min = std::max(0.0f, (float) atof(e));
++        result->adapt.assign(n_seq, {});
++        if (result->adapt_min > 0.0f) {
++            LOG_INF("%s: adaptive speculation: pause drafting below %.2f accepted tokens per round\n", __func__, result->adapt_min);
++        }
++    }
++
+     const int32_t n_max_configured = common_speculative_n_max(&params);
+     const int32_t n_max_effective  = common_speculative_n_max(result.get());
+     const auto rates = common_speculative_synth_rates_resolve(&params, n_max_effective);
+@@ -2795,6 +2831,17 @@ void common_speculative_draft(common_speculative * spec) {
+ 
+     auto & dparams = spec->dparams;
+ 
++    // adaptive speculation: sequences in a pause do not draft this step
++    std::vector<char> attempted(dparams.size(), 0);
++    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
++        auto & dp = dparams[seq_id];
++        if (dp.drafting && spec->adapt_min > 0.0f && (size_t) seq_id < spec->adapt.size() && spec->adapt[seq_id].cooldown > 0) {
++            spec->adapt[seq_id].cooldown--;
++            dp.drafting = false;
++        }
++        attempted[seq_id] = dp.drafting;
++    }
++
+     {
+         int n_drafting = 0;
+ 
+@@ -2870,6 +2917,10 @@ void common_speculative_draft(common_speculative * spec) {
+         if (dp.drafting) {
+             dp.drafting = false;
+         }
++        // a drafting attempt that produced nothing still paid for the draft pass: count it as zero accepted
++        if (attempted[seq_id] && dp.result->empty()) {
++            spec->adapt_update(seq_id, 0.0f);
++        }
+     }
+ }
+ 
+@@ -2881,6 +2932,8 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+         return;
+     }
+ 
++    spec->adapt_update(seq_id, (float) n_accepted);
++
+     {
+         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 742bcd5d5..0c4c938bd 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1601,8 +1601,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     };
+ 
+     // assign the input layer
+-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
++    // there is very little benefit to offloading the input layer, so keep it on the CPU - except when every layer is
++    // offloaded and LLAMA_OFFLOAD_INPUT is set: on unified-memory GPUs (Strix Halo) the CPU GET_ROWS costs a
++    // cross-backend sync per token for no memory saving (#25700)
+     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
++    if (getenv("LLAMA_OFFLOAD_INPUT") != nullptr && i_gpu_start == 0) {
++        pimpl->dev_input = get_layer_buft_list(0);
++    }
+ 
+     // assign the repeating layers to the devices according to the splits
+     pimpl->dev_layer.resize(n_layer_all);
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index 084c49007..717b47d28 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -113,7 +113,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
+ 
+     // optional interleaved sliding-window attention with per-layer pattern array.
+     // DFlash has a single rope, so the SWA rope == main rope.
+-    if (ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false) && hparams.n_swa > 0) {
++    if (!getenv("DFLASH_NO_SWA") && ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false) && hparams.n_swa > 0) {
+         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+         ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
+         hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+-- 
+2.53.0
+

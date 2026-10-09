@@ -1,0 +1,270 @@
+From ac5f7bfc3cd1c274a5fb43afa3828ea4368697e4 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 20:30:41 -0400
+Subject: [PATCH 01/11] laguna/gfx1151: DFlash Laguna drafter (aux norm, gated
+ attention, context norm, causal), Laguna layer-input taps, decode FA override
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp      |  4 +++
+ ggml/src/ggml-cuda/fattn.cu | 15 +++++++++-
+ src/llama-arch.cpp          |  2 ++
+ src/llama-arch.h            |  1 +
+ src/llama-model.h           |  1 +
+ src/models/dflash.cpp       | 57 ++++++++++++++++++++++++++++++++-----
+ src/models/laguna.cpp       | 14 ++++++++-
+ 7 files changed, 85 insertions(+), 9 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 5c36c9ca5..381052af2 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -989,6 +989,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             }
+             if (llama_model_meta_val_str(model_dft, "dflash.attention.causal", buf, sizeof(buf)) >= 0) {
+                 causal_attn = std::strcmp(buf, "true") == 0;
++            } else if (llama_model_meta_val_str(model_dft, "dflash.decoder_arch", buf, sizeof(buf)) >= 0 &&
++                       std::strcmp(buf, "laguna") == 0) {
++                // poolside's Laguna drafter is trained causal (dflash_config.causal); its GGUFs predate the key
++                causal_attn = true;
+             }
+         }
+ 
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index bb34e01f3..b1999eac9 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -538,7 +538,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
+     }
+ }
+ 
+-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
++static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, const ggml_tensor * dst) {
+ #ifndef FLASH_ATTN_AVAILABLE
+     GGML_UNUSED(device); GGML_UNUSED(dst);
+     return BEST_FATTN_KERNEL_NONE;
+@@ -719,6 +719,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+     return BEST_FATTN_KERNEL_TILE;
+ }
+ 
++// local A/B (laguna-gfx1151): GGML_FATTN_DECODE=vec|mma|tile overrides the kernel chosen for single-token decode
++static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
++    const best_fattn_kernel k = ggml_cuda_get_best_fattn_kernel_impl(device, dst);
++    static const char * ov = getenv("GGML_FATTN_DECODE");
++    if (ov == nullptr || k == BEST_FATTN_KERNEL_NONE || dst->src[0]->ne[1] != 1) {
++        return k;
++    }
++    if (strcmp(ov, "vec") == 0)  { return BEST_FATTN_KERNEL_VEC; }
++    if (strcmp(ov, "mma") == 0)  { return BEST_FATTN_KERNEL_MMA_F16; }
++    if (strcmp(ov, "tile") == 0) { return BEST_FATTN_KERNEL_TILE; }
++    return k;
++}
++
+ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
+     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+ 
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index cc361c7f2..7c983e39e 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -489,6 +489,7 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_CLS_OUT,                                "cls.output" },
+     { LLM_TENSOR_CLS_NORM,                               "cls.norm" },
+     { LLM_TENSOR_ENC_OUTPUT_NORM,                        "enc.output_norm" },
++    { LLM_TENSOR_ENC_AUX_NORM,                           "enc.aux_norm" },
+     { LLM_TENSOR_FFN_GATE_INP_SHEXP,                     "blk.%d.ffn_gate_inp_shexp" },
+     { LLM_TENSOR_SSM_A_NOSCAN,                           "blk.%d.ssm_a" },
+     { LLM_TENSOR_SSM_CONV1D,                             "blk.%d.ssm_conv1d" },
+@@ -743,6 +744,7 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_OUTPUT_NORM_LFM2,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+     {LLM_TENSOR_DEC_OUTPUT_NORM,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+     {LLM_TENSOR_ENC_OUTPUT_NORM,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
++    {LLM_TENSOR_ENC_AUX_NORM,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+     {LLM_TENSOR_ROPE_FREQS,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ROPE}},
+     {LLM_TENSOR_ROPE_FACTORS_LONG,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ROPE}},
+     {LLM_TENSOR_ROPE_FACTORS_SHORT,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ROPE}},
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 612b6797a..e07f49169 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -655,6 +655,7 @@ enum llm_tensor {
+     LLM_TENSOR_ENC_FFN_DOWN,
+     LLM_TENSOR_ENC_FFN_UP,
+     LLM_TENSOR_ENC_OUTPUT_NORM,
++    LLM_TENSOR_ENC_AUX_NORM,
+     LLM_TENSOR_CLS,
+     LLM_TENSOR_CLS_OUT,
+     LLM_TENSOR_CLS_NORM,
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 25e514869..59d6afc61 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -660,6 +660,7 @@ struct llama_model {
+     struct ggml_tensor * output          = nullptr;
+     struct ggml_tensor * output_b        = nullptr;
+     struct ggml_tensor * output_norm_enc = nullptr;
++    struct ggml_tensor * enc_aux_norm    = nullptr; // DFlash (Laguna): per-target-layer RMSNorm of the fc input slices
+ 
+ 
+     // NVFP4 per-tensor scale2, input_scale for LM head
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index c448e63f3..084c49007 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -4,6 +4,24 @@
+ #include "llama-kv-cache.h"
+ #include "llama-kv-cache-iswa.h"
+ 
++// Laguna DFlash: RMS-normalise each target layer's slice of the fc input with its own weight (enc.aux_norm, one
++// [n_embd_target] row per tapped layer) before the projection. No-op for drafts without the tensor.
++static ggml_tensor * dflash_aux_norm(ggml_context * ctx, const llama_model & model, float eps, ggml_tensor * x) {
++    if (model.enc_aux_norm == nullptr) {
++        return x;
++    }
++    const int64_t d = model.enc_aux_norm->ne[0];
++    const int64_t n = model.enc_aux_norm->ne[1];
++    const int64_t t = ggml_nelements(x) / (d * n);
++    if (!ggml_is_contiguous(x)) {
++        x = ggml_cont(ctx, x);
++    }
++    x = ggml_reshape_3d(ctx, x, d, n, t);
++    x = ggml_rms_norm(ctx, x, eps);
++    x = ggml_mul(ctx, x, model.enc_aux_norm);
++    return ggml_reshape_2d(ctx, x, d * n, t);
++}
++
+ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
+ 
+     ml.get_key(LLM_KV_EMBEDDING_SCALE, hparams.f_embedding_scale, false);
+@@ -162,6 +180,11 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
+     fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
+     fc_s            = create_tensor(tn(LLM_TENSOR_FC,              "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
+     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
++    // Laguna DFlash: each target layer's hidden state is RMS-normalised with its own weight before fc
++    if (const ggml_tensor * aux = ml->get_tensor_meta(tn(LLM_TENSOR_ENC_AUX_NORM, "weight").str().c_str())) {
++        enc_aux_norm = create_tensor(tn(LLM_TENSOR_ENC_AUX_NORM, "weight"), { aux->ne[0], aux->ne[1] }, 0);
++        GGML_ASSERT(aux->ne[0] * aux->ne[1] == n_embd_inp);
++    }
+     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
+ 
+     // optional: reduced-vocab drafts ship their own lm head, full-vocab drafts can share the target's via ctx_other
+@@ -239,6 +262,9 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
+         layer.out_scale      = create_tensor(tn(LLM_TENSOR_LAYER_OUT_SCALE, "weight", i), { 1 }, TENSOR_NOT_REQUIRED);
+         layer.rope_freqs     = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), { n_embd_head_k/2 }, TENSOR_NOT_REQUIRED | (i > 0 ? TENSOR_DUPLICATED : 0));
+ 
++        // optional per-head softplus attention output gate (Laguna DFlash)
++        layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), { n_embd, n_head }, TENSOR_NOT_REQUIRED);
++
+         // optional per-head attention sinks (e.g. Nemotron DSpark)
+         layer.attn_sinks = create_tensor(tn(LLM_TENSOR_ATTN_SINKS, "weight", i), { n_head }, TENSOR_NOT_REQUIRED);
+ 
+@@ -280,6 +306,7 @@ template <>
+ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+     ggml_tensor * cur = build_inp_embd_enc();
+ 
++    cur = dflash_aux_norm(ctx0, model, hparams.f_norm_rms_eps, cur);
+     cur = build_lora_mm(model.fc, cur, model.fc_s);
+     cb(cur, "fc_out", -1);
+ 
+@@ -616,16 +643,20 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
+         res->add_input(std::move(inp));
+ 
+         // fuse the target features through the encoder
+-        ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
++        ggml_tensor * inp_g = build_lora_mm(model.fc, dflash_aux_norm(ctx0, model, hparams.f_norm_rms_eps, inp_target), model.fc_s);
+         inp_g = build_norm(inp_g, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
+         cb(inp_g, "inp_g_embeddings", -1);
+ 
+         for (int il = 0; il < n_layer; ++il) {
+             const auto & layer = model.layers[il];
+ 
+-            ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g, layer.wk_s);
++            // Laguna DFlash projects the context through each layer's input norm first (poolside's reference
++            // _project_context_kv); the z-lab Qwen drafters take the fc states as they are
++            static const bool no_ctxnorm = getenv("DFLASH_NO_CTXNORM") != nullptr;
++            ggml_tensor * ctx_in = (model.enc_aux_norm && !no_ctxnorm) ? build_norm(inp_g, layer.attn_norm, NULL, LLM_NORM_RMS, il) : inp_g;
++            ggml_tensor * Kcur = build_lora_mm(layer.wk, ctx_in, layer.wk_s);
+             const bool shared_kv = layer.wv == nullptr;
+-            ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, inp_g, layer.wv_s);
++            ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, ctx_in, layer.wv_s);
+ 
+             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+             Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+@@ -734,10 +765,22 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
+         cb(Kcur, "Kcur", il);
+         cb(Vcur, "Vcur", il);
+ 
+-        // cache-aware, non-causal attention
++        // cache-aware attention (non-causal unless the GGUF sets attention.causal). With a Laguna output gate the
++        // projection is applied after gating: softplus(gate(x)) scales each head's output before wo.
++        ggml_tensor * wo_attn = layer.wqkv_gate ? nullptr : layer.wo;
+         ggml_tensor * cur = use_iswa
+-            ? build_attn(inp_attn_iswa, layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
+-            : build_attn(inp_attn,      layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
++            ? build_attn(inp_attn_iswa, wo_attn, NULL, layer.wqkv_gate ? nullptr : layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
++            : build_attn(inp_attn,      wo_attn, NULL, layer.wqkv_gate ? nullptr : layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
++        if (layer.wqkv_gate) {
++            ggml_tensor * gate = ggml_softplus(ctx0, build_lora_mm(layer.wqkv_gate, noise_norm));
++            cb(gate, "attn_gate_softplus", il);
++            cur  = ggml_reshape_3d(ctx0, cur,  n_embd_head, n_head, n_tokens);
++            gate = ggml_reshape_3d(ctx0, gate, 1,           n_head, n_tokens);
++            cur  = ggml_mul(ctx0, cur, gate);
++            cur  = ggml_reshape_2d(ctx0, cur, n_embd_head * n_head, n_tokens);
++            cur  = build_lora_mm(layer.wo, cur, layer.wo_s);
++            cb(cur, "attn_out_gated", il);
++        }
+ 
+         if (hparams.f_attn_value_scale != 0.0f) {
+             cur = ggml_scale(ctx0, cur, hparams.f_attn_value_scale);
+@@ -882,7 +925,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
+         res->add_input(std::move(inp));
+ 
+         // fuse the target features through the encoder
+-        ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
++        ggml_tensor * inp_g = build_lora_mm(model.fc, dflash_aux_norm(ctx0, model, hparams.f_norm_rms_eps, inp_target), model.fc_s);
+         inp_g = build_norm(inp_g, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
+         cb(inp_g, "inp_g_embeddings", -1);
+ 
+diff --git a/src/models/laguna.cpp b/src/models/laguna.cpp
+index 2bc4fa8a0..316a4cae6 100644
+--- a/src/models/laguna.cpp
++++ b/src/models/laguna.cpp
+@@ -169,7 +169,13 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
+ 
+     const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
+ 
++    // a draft reading the last layer's output needs every row of it: crop to the output rows after recording it
++    const bool extract_final_inp = (size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer];
++
+     for (int il = 0; il < n_layer; ++il) {
++        // DFlash / EAGLE3 drafts read target hidden states (layer inputs; index n_layer = the last layer's output)
++        res->t_layer_inp[il] = inpL;
++
+         const bool    is_swa_il   = hparams.is_swa(il);
+         const int64_t n_head_il   = hparams.n_head(il);
+         const int64_t n_head_kv_il = hparams.n_head_kv(il);
+@@ -259,7 +265,7 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
+             cb(cur, "attn_o_proj", il);
+         }
+ 
+-        if (il == n_layer - 1 && inp_out_ids) {
++        if (il == n_layer - 1 && inp_out_ids && !extract_final_inp) {
+             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+         }
+@@ -317,6 +323,12 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
+ 
+         inpL = cur;
+     }
++    if (extract_final_inp) {
++        res->t_layer_inp[n_layer] = inpL;
++        if (inp_out_ids) {
++            inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
++        }
++    }
+ 
+     cur = inpL;
+     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
+-- 
+2.53.0
+
