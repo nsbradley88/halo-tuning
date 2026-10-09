@@ -73,6 +73,13 @@ The last row is a warning: a technique that is free on one model can quietly bre
   prefill, the DFlash drafter window, adaptive speculation pause, the quantize fix). Each model page marks which settings
   work on stock llama.cpp and which need the patches.
 
+## Community posts
+
+- Strata: benchmark report [Niko1221/Strata#1716](https://github.com/Niko1221/Strata/pull/1716); `--expert-cache auto`
+  OOM on unified memory [Niko1221/Strata#1715](https://github.com/Niko1221/Strata/issues/1715)
+- Laguna: [poolside/Laguna-S-2.1 discussion #43](https://huggingface.co/poolside/Laguna-S-2.1/discussions/43)
+- MiMo: [XiaomiMiMo/MiMo-V2.6-Flash-MOPD discussion #2](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-MOPD/discussions/2)
+
 ## License
 
 Docs and configs: MIT. The llama.cpp patches are derived from llama.cpp (MIT); three of them are by Nathan Wilson
