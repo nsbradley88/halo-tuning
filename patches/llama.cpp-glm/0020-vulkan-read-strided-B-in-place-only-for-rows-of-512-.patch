@@ -1,0 +1,54 @@
+From f0df6d32a9e67026f36414365fa0048362292c96 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 10:50:20 +0000
+Subject: [PATCH 20/23] vulkan: read strided B in place only for rows of >= 512
+ elements
+
+Cold timings (Radeon 8060S): MLA wv_b (k=512) strided 46.8 vs copied 49.9 us at n=3 and 42.6 vs 44.6 at n=1;
+MLA wk_b (k=256) copied 55.3 vs strided 58.5 us at n=3, 45.4 vs 48.1 at n=1.
+GGML_VK_MMV_STRIDED_Y_MIN_COLS sets the column threshold (default 1).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 5f6bf1aa148567be5f18b2af15a46a37de532fa5)
+---
+ ggml/src/ggml-vulkan/ggml-vulkan-types.h | 1 +
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp     | 4 ++++
+ 2 files changed, 5 insertions(+)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index b4aeb5211..c2f9b3cbf 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -1037,6 +1037,7 @@ struct vk_device_struct {
+ 
+     bool disable_fusion;
+     bool disable_batched_mmv;
++    uint32_t mmv_strided_y_min_cols;
+     uint32_t dmmv_large_max_m;
+     uint32_t dmmv_large_min_k;
+     bool disable_descriptor_reuse;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 2021c8ab7..86b93b1e4 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -4941,6 +4941,9 @@ vk_device ggml_vk_get_device(size_t idx) {
+ 
+         device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
+         device->disable_batched_mmv = getenv("GGML_VK_DISABLE_BATCHED_MMV") != nullptr;
++        // read strided f32 B in place (rows of >= 512 elements) from this many columns on; shorter rows were faster
++        // through the contiguous copy (MLA wk_b k=256: 55.3 vs 58.5 us at n=3, wv_b k=512: 49.9 vs 46.8 us)
++        device->mmv_strided_y_min_cols = getenv("GGML_VK_MMV_STRIDED_Y_MIN_COLS") ? (uint32_t) std::stoul(getenv("GGML_VK_MMV_STRIDED_Y_MIN_COLS")) : 1;
+         // AMD workgroup-size heuristic for mul_mat_vec (see ggml_vk_get_dequantize_mul_mat_vec), tuned on RDNA3
+         const bool large_wg_default = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3;
+         device->dmmv_large_max_m = getenv("GGML_VK_DMMV_LARGE_MAX_M") ? (uint32_t) std::stoul(getenv("GGML_VK_DMMV_LARGE_MAX_M")) : (large_wg_default ? 1024 : 0);
+@@ -6741,6 +6744,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     // instead of copying it to a contiguous buffer first.
+     const size_t y_ts = ggml_type_size(src1->type);
+     const bool y_strided = y_non_contig && !swap_inputs && src1->type == GGML_TYPE_F32 &&
++                           ne11 >= ctx->device->mmv_strided_y_min_cols && ne10 >= 512 &&
+                            src1->nb[0] == y_ts && ne10 % 4 == 0 &&
+                            src1->nb[1] % (4 * y_ts) == 0 && src1->nb[2] % (4 * y_ts) == 0 &&
+                            (ne13 == 1 || src1->nb[3] == src1->nb[2] * ne12) &&
+-- 
+2.43.0
+

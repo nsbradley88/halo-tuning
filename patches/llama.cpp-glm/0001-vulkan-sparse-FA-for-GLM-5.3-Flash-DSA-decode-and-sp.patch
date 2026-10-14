@@ -1,0 +1,92 @@
+From 7ec2899a4de24e22316795d025f37845090bbee1 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 20:21:40 -0400
+Subject: [PATCH 01/23] vulkan: sparse FA for GLM-5.3-Flash DSA decode and
+ speculative verify
+
+GLM-5.3-Flash puts 64 query heads on one MLA KV head, which exceeds max_gqa (32), so
+the GQA fold was skipped and small batches (MTP verify, 2-3 tokens) fell back to dense
+FA over the whole KV cache (8x slower at 32K).
+
+- Fold max_gqa heads per workgroup when the head ratio is a multiple of it, several
+  workgroups per KV head (GGML_VK_FA_GQA_SPLIT_DISABLE turns it off). Decode FA at
+  32K: 6.9 -> 2.8 ms/token; the fold also covers the sparse path for N <= 8.
+- Unfolded small batches may take the per-row sparse path with the scalar Br == 1
+  variant (GGML_VK_FA_SPARSE_ROWS, default 8, 0 = off).
+- test-backend-ops: GLM-shaped sparse cases (512/512, 64:1, KV 32K, budget 2048,
+  nb 1-9, f16/q8_0).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 20 +++++++++++++++++---
+ tests/test-backend-ops.cpp           |  7 +++++++
+ 2 files changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 05c63b64e..fa2ab6798 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -8110,12 +8110,17 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
+     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
+ 
+-    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
++    // More heads per KV head than one workgroup holds (e.g. 64 heads on one MLA KV head): fold max_gqa of them per
++    // workgroup, several workgroups per KV head. The shader maps iq2 to its KV head through rk2.
++    // GGML_VK_FA_GQA_SPLIT_DISABLE turns this off.
++    static const bool gqa_split = getenv("GGML_VK_FA_GQA_SPLIT_DISABLE") == nullptr;
++    const uint32_t gqa_fold = (gqa_split && qk_ratio > max_gqa && qk_ratio % max_gqa == 0) ? max_gqa : qk_ratio;
++    if (N <= 8 && qk_ratio > 1 && gqa_fold <= max_gqa &&
+         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
+         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
+         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
+         // and change addressing calculations to index Q's dimension 2.
+-        gqa_ratio = qk_ratio;
++        gqa_ratio = gqa_fold;
+         N = gqa_ratio;
+         workgroups_y /= gqa_ratio;
+     }
+@@ -8146,12 +8151,21 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+         return (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) ||
+                (t->nb[1] | t->nb[2] | t->nb[3]) % (4 * sizeof(ggml_fp16_t)) == 0;
+     };
++    // GGML_VK_FA_SPARSE_ROWS: largest unfolded batch that may take the per-row sparse path (default 8, 0 = off)
++    static const uint32_t sparse_max_rows = getenv("GGML_VK_FA_SPARSE_ROWS") ? (uint32_t)atoi(getenv("GGML_VK_FA_SPARSE_ROWS")) : 8;
++    const bool sparse_rows1 = gqa_ratio == 1 && N > 1 && N <= sparse_max_rows &&
++                              get_fa_tuning_params(ctx->device, HSK, HSV, 1, KV, k_type_eff, v_type_eff, f32acc).path == FA_SCALAR;
+     const bool use_sparse = !disable_sparse && n_kv_max > 0 && mask &&
+                             max_bias == 0.0f && logit_softcap == 0.0f &&
+                             (tuning_params.path != FA_COOPMAT2 || (sparse_gather_aligned(k) && sparse_gather_aligned(v))) &&
+                             nem0 == KV &&
+                             (int64_t)KV >= std::max<int64_t>(4096, min_ratio * (int64_t)n_kv_max) &&
+-                            (gqa_ratio > 1 || (tuning_params.path == FA_SCALAR && N == 1));
++                            (gqa_ratio > 1 || (tuning_params.path == FA_SCALAR && N == 1) || sparse_rows1);
++    // Small multi-token batches without a GQA fold (speculative verify, e.g. 64 heads on one MLA KV head): run the
++    // scalar Br == 1 variant, one query row per workgroup, so each tile still shares a single sparse mask row.
++    if (use_sparse && sparse_rows1) {
++        tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 1, KV, k_type_eff, v_type_eff, f32acc);
++    }
+ 
+     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
+     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index bd599e99e..1df096396 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11733,6 +11733,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 1, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_1, GGML_TYPE_Q4_1, {0, 1, 2, 3}, true, false, 512));
+     // KV not a multiple of the compaction workgroup size.
+     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 5003, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
++    // GLM-5.3-Flash DSA (MLA nope 512, V is a view of K, 64 heads on 1 KV head, budget 2048): small unfolded batches
++    // (speculative verify) take the per-row sparse path.
++    for (int64_t nb : { 1, 2, 3, 4, 8, 9 }) {
++        for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
++            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 1, 2, 3}, true, true, 2048));
++        }
++    }
+ 
+     // Sparse gather: native block sizes, padded slots, and head/batch strides.
+     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
+-- 
+2.43.0
+

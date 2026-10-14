@@ -1,0 +1,72 @@
+From 3b0c38aab257f32ccea9672b36cf75f4b8b5c7bd Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 10:00:45 +0000
+Subject: [PATCH 19/23] test-backend-ops: GLM matvec perf case after a dirty
+ copy (KDA state-snapshot writeback)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 3affe881d35cb6fa6bf132da8d2119b11bbbfa4c)
+---
+ tests/test-backend-ops.cpp | 23 ++++++++++++++++++++---
+ 1 file changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f6cd952a6..3f2d40712 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9879,9 +9879,10 @@ struct test_mul_mat_glm : public test_case {
+     const int64_t batch;
+     const bool b_perm;
+     const int64_t nw; // > 1: nw distinct weights and inputs, summed (cold-cache timing via GGML_VK_PERF_LOGGER)
++    const int64_t dirty_mb; // > 0: a dirty_mb MiB copy right before each matvec
+ 
+     std::string vars() override {
+-        return VARS_TO_STR7(type_a, m, n, k, batch, b_perm, nw);
++        return VARS_TO_STR8(type_a, m, n, k, batch, b_perm, nw, dirty_mb);
+     }
+ 
+     double max_nmse_err() override { return 5e-4; }
+@@ -9893,8 +9894,8 @@ struct test_mul_mat_glm : public test_case {
+     }
+ 
+     test_mul_mat_glm(ggml_type type_a = GGML_TYPE_Q4_K, int64_t m = 4096, int64_t n = 1, int64_t k = 8192,
+-            int64_t batch = 1, bool b_perm = false, int64_t nw = 1)
+-        : type_a(type_a), m(m), n(n), k(k), batch(batch), b_perm(b_perm), nw(nw) {}
++            int64_t batch = 1, bool b_perm = false, int64_t nw = 1, int64_t dirty_mb = 0)
++        : type_a(type_a), m(m), n(n), k(k), batch(batch), b_perm(b_perm), nw(nw), dirty_mb(dirty_mb) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * out = nullptr;
+@@ -9911,6 +9912,16 @@ struct test_mul_mat_glm : public test_case {
+                 b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, batch);
+                 ggml_set_name(b, "b");
+             }
++            if (dirty_mb > 0) {
++                // write dirty_mb MiB right before the matvec (like the KDA recurrent-state snapshots), and make b
++                // depend on it so the copy runs first
++                const int64_t ne = dirty_mb * 262144;
++                ggml_tensor * src = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne);
++                ggml_tensor * dst = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne);
++                ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
++                ggml_tensor * dep = ggml_view_1d(ctx, cpy, 1, 0);
++                b = ggml_add(ctx, b, dep);
++            }
+             ggml_tensor * mm = ggml_mul_mat(ctx, a, b);
+             out = out ? ggml_add(ctx, out, mm) : mm;
+         }
+@@ -9970,6 +9981,12 @@ static void add_glm_verify_mul_mat_cases(std::vector<std::unique_ptr<test_case>>
+                 test_cases.emplace_back(new test_mul_mat_glm(s.t, s.m, n, s.k, s.batch, s.b_perm, nw));
+             }
+         }
++        // KDA wo after the recurrent-state snapshot writes (12 MiB at a 3-token verify, 4 MiB at one token)
++        for (int64_t dirty : {4, 12, 24}) {
++            for (int64_t n : {1, 3}) {
++                test_cases.emplace_back(new test_mul_mat_glm(GGML_TYPE_Q4_K, 4096, n, 8192, 1, false, 12, dirty));
++            }
++        }
+     }
+ }
+ 
+-- 
+2.43.0
+

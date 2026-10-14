@@ -1,0 +1,70 @@
+From aa7174f8c89cf18fe3e55c36fac0714798cf95d2 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 00:25:49 -0400
+Subject: [PATCH 06/23] speculative: --spec-draft-ubatch for a smaller
+ draft-context ubatch
+
+The draft (MTP) context copied the target n_ubatch, so its compute buffer grew with
+the target ubatch (GLM-5.3-Flash: 364 MiB at ub 768, ~1.1 GiB at 2048). A smaller
+draft ubatch (128: 155 MiB) frees that memory for a larger target ubatch; MTP
+acceptance is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/arg.cpp         | 10 ++++++++++
+ common/common.h        |  1 +
+ common/speculative.cpp |  5 +++++
+ 3 files changed, 16 insertions(+)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 6bc4a84e2..7d9d97fb8 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -4156,6 +4156,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         }
+     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
+ 
++    add_opt(common_arg(
++        {"--spec-draft-ubatch"}, "N",
++        "physical batch size of the draft context; its compute buffer scales with it (default: 0 = the target's)",
++        [](common_params & params, int value) {
++            if (value < 0) {
++                throw std::invalid_argument("invalid value");
++            }
++            params.speculative.draft.n_ubatch = value;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_UBATCH"));
+     add_opt(common_arg(
+         {"--spec-draft-n-max"}, "N",
+         string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
+diff --git a/common/common.h b/common/common.h
+index b6683fe67..89f0523c6 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -328,6 +328,7 @@ struct common_params_model {
+ struct common_params_speculative_draft {
+     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
+     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
++    int32_t n_ubatch = 0; // physical batch size of the draft context (0 = the target's)
+ 
+     float p_split = 0.1f; // speculative decoding split probability
+     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index c5043a4a8..7b0ffc37b 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2617,6 +2617,11 @@ common_speculative_init_result::common_speculative_init_result(
+     // the draft context holds as many tokens per sequence as the target context
+     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+ 
++    // a smaller draft ubatch shrinks the draft compute buffer; prompt batches are split into more ubatches
++    if (params.speculative.draft.n_ubatch > 0) {
++        cparams.n_ubatch = std::min<uint32_t>(cparams.n_ubatch, params.speculative.draft.n_ubatch);
++    }
++
+     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
+     //       the extra memory for small models is likely negligible?
+     cparams.n_rs_seq  = 0;
+-- 
+2.43.0
+

@@ -1,0 +1,249 @@
+From 8020cac2cb0ea0520416eeb13d0ba0b1bca9205c Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 02:28:59 -0400
+Subject: [PATCH 07/23] vulkan: int8 coopmat MMQ for IQ2_S and IQ3_S (dense and
+ mul_mat_id)
+
+RDNA3/4 had int8 coopmat MMQ (cm1_int) only for Q4_0-Q6_K, IQ4 and FP4; IQ2_S / IQ3_S
+experts dequantized to f16. New cm1 loaders decode one 32-value sub-block per thread
+(LOAD_VEC_A 32: per-row loads stay local; 4 threads x 8 values made 14 scattered 2-byte
+loads per sub-block and were load-bound, -27% from this alone), with the grids in shared
+memory. IQ2_S keeps a scale per 16 values (KSCALES 2) on the 128-row tile.
+
+GLM-5.3-Flash routed experts (288 x top 8, 4096 -> 2048), gfx1151:
+  IQ2_S 512 / 1024 / 2048 rows: 21.0 / 24.5 / 33.3 -> 14.8 / 17.4 / 25.7 ms
+  IQ3_S 512 / 1024 / 2048 rows: 24.1 / 27.4 / 36.4 -> 14.6 / 16.6 / 23.3 ms
+(HIP MMQ: 12.1 / 16.4 / 26.2 and 10.6 / 17.9 / 22.7.) Prompt 172/159/147 ->
+203/188/172 tok/s at 2K/8K/32K; KLD 0.0406 -> 0.0426 (int8 activations).
+GGML_VK_MMID_TILE forces the q8_1 mul_mat_id tile for experiments.
+
+test-backend-ops: perf cases for Q4_0 / IQ4_XS / Q4_K on the GLM expert shapes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 23 +++++-
+ .../vulkan-shaders/mul_mmq_cm1.comp           | 10 ++-
+ .../vulkan-shaders/mul_mmq_cm1_funcs.glsl     | 82 +++++++++++++++++++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |  2 +-
+ tests/test-backend-ops.cpp                    |  2 +-
+ 5 files changed, 113 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index a97bb6bc7..f8aef2631 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1560,6 +1560,10 @@ static bool ggml_vk_matmul_cm1_int_shmem_support(const vk_device& device, const
+             kscales2 = true;                        break;
+         case GGML_TYPE_NVFP4:
+             kscales2 = true; has_kvalues = true;    break;
++        case GGML_TYPE_IQ3_S:
++            break;
++        case GGML_TYPE_IQ2_S:
++            kscales2 = true;                        break;
+         default:
+             return false;
+     }
+@@ -1587,6 +1591,12 @@ static bool ggml_vk_matmul_cm1_int_shmem_support(const vk_device& device, const
+     if (src0_type == GGML_TYPE_NVFP4 && !device->ocp_fp4) {
+         total += 128u * (uint32_t)sizeof(float);         // ue4m3_fp32_lut[128]
+     }
++    if (src0_type == GGML_TYPE_IQ3_S) {
++        total += 512u * (uint32_t)sizeof(uint32_t);      // iq3s_grid[512] (types.glsl, init_iq_shmem)
++    }
++    if (src0_type == GGML_TYPE_IQ2_S) {
++        total += 1024u * 2u * (uint32_t)sizeof(uint32_t); // iq2s_grid[1024] (uvec2)
++    }
+     if (mul_mat_id) {
+         total += BN * 2u * (uint32_t)sizeof(uint16_t);   // row_ids[BN] (u16vec2)
+     }
+@@ -2488,6 +2498,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q4_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_k_q8_1",   matmul_q4_k_q8_1_cm1_len,   matmul_q4_k_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
+             if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q5_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q5_k_q8_1",   matmul_q5_k_q8_1_cm1_len,   matmul_q5_k_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
+             cm1_create_mmq({GGML_TYPE_Q6_K,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_k, "matmul_q6_k_q8_1",   matmul_q6_k_q8_1_cm1_len,   matmul_q6_k_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
++            cm1_create_mmq({GGML_TYPE_IQ2_S,  GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_iq2_s_q8_1",  matmul_iq2_s_q8_1_cm1_len,  matmul_iq2_s_q8_1_cm1_data,  sizeof(vk_mat_mat_push_constants), 3);
++            cm1_create_mmq({GGML_TYPE_IQ3_S,  GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_iq3_s_q8_1",  matmul_iq3_s_q8_1_cm1_len,  matmul_iq3_s_q8_1_cm1_data,  sizeof(vk_mat_mat_push_constants), 3);
+             if (!rdna4) { cm1_create_mmq({GGML_TYPE_NVFP4, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_k, "matmul_nvfp4_q8_1",  matmul_nvfp4_q8_1_cm1_len,  matmul_nvfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_push_constants), 3); }
+         }
+ 
+@@ -2561,6 +2573,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             cm1_create_mmq({GGML_TYPE_Q4_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q4_k_q8_1",   matmul_id_subgroup_q4_k_q8_1_cm1_len,   matmul_id_subgroup_q4_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
+             cm1_create_mmq({GGML_TYPE_Q5_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q5_k_q8_1",   matmul_id_subgroup_q5_k_q8_1_cm1_len,   matmul_id_subgroup_q5_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
+             cm1_create_mmq({GGML_TYPE_Q6_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int_k, "matmul_id_subgroup_q6_k_q8_1",   matmul_id_subgroup_q6_k_q8_1_cm1_len,   matmul_id_subgroup_q6_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
++            cm1_create_mmq({GGML_TYPE_IQ2_S,  GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_iq2_s_q8_1",  matmul_id_subgroup_iq2_s_q8_1_cm1_len,  matmul_id_subgroup_iq2_s_q8_1_cm1_data,  sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
++            cm1_create_mmq({GGML_TYPE_IQ3_S,  GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_iq3_s_q8_1",  matmul_id_subgroup_iq3_s_q8_1_cm1_len,  matmul_id_subgroup_iq3_s_q8_1_cm1_data,  sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
+             if (!rdna4) { cm1_create_mmq({GGML_TYPE_NVFP4, GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int_k, "matmul_id_subgroup_nvfp4_q8_1",  matmul_id_subgroup_nvfp4_q8_1_cm1_len,  matmul_id_subgroup_nvfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); }
+         }
+     } else
+@@ -7422,7 +7436,14 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, nei1, true));
+     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
+ 
+-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, nei1, aligned, true);
++    // GGML_VK_MMID_TILE forces the q8_1 mul_mat_id tile (0 s, 1 m, 2 l) for experiments.
++    const uint32_t n_tile = (uint32_t)nei1;
++    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, n_tile, aligned, true);
++    static const char * mmid_tile = getenv("GGML_VK_MMID_TILE");
++    if (mmid_tile && quantize_y) {
++        const size_t idx = std::min<size_t>((size_t)atoi(mmid_tile), mmp_map->size() - 1);
++        pipeline = (*mmp_map)[idx].unaligned;
++    }
+ 
+     const uint32_t bn = pipeline->wg_denoms[1];
+     const uint64_t max_tiles = ggml_vk_mul_mat_id_max_tiles(n_as, nei0 * nei1, bn);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_cm1.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_cm1.comp
+index 17280d17b..91e2abb37 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_cm1.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_cm1.comp
+@@ -19,7 +19,7 @@
+ 
+ #include "types.glsl"
+ 
+-#if defined(DATA_A_Q3_K) || defined(DATA_A_Q6_K) || defined(DATA_A_NVFP4)
++#if defined(DATA_A_Q3_K) || defined(DATA_A_Q6_K) || defined(DATA_A_NVFP4) || defined(DATA_A_IQ2_S)
+ #define KSCALES 2
+ #else
+ #define KSCALES 1
+@@ -114,7 +114,9 @@ shared float buf_b_s[BN * BK_STEP];
+ shared int8_t cm1_kvalues[16];
+ #endif
+ 
+-#if defined(DATA_A_QUANT_K) || defined(DATA_A_IQ4_XS) || defined(DATA_A_NVFP4)
++#if defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_S)
++#define LOAD_VEC_A 32
++#elif defined(DATA_A_QUANT_K) || defined(DATA_A_IQ4_XS) || defined(DATA_A_NVFP4)
+ #define LOAD_VEC_A 8
+ #else
+ #define LOAD_VEC_A (4 * QUANT_R)
+@@ -158,7 +160,9 @@ void main() {
+     _ne1 = data_row_map[2 + 2 * tile_idx];
+     const uint ic = 0;
+ #endif
+-#if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
++#if defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_S)
++    init_iq_shmem(gl_WorkGroupSize);
++#elif defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
+     if (gl_LocalInvocationIndex < 16u) {
+         cm1_kvalues[gl_LocalInvocationIndex] = kvalues_iq4nl_const[gl_LocalInvocationIndex];
+     }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_cm1_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_cm1_funcs.glsl
+index 1760c138e..68e98264d 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_cm1_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_cm1_funcs.glsl
+@@ -461,6 +461,88 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr) {
+     }
+ }
+ 
++#elif defined(DATA_A_IQ3_S)
++
++// One thread per 32-value sub-block (LOAD_VEC_A 32): 8 grid indices (9 bits, 4 magnitudes 1..15 each), 32 sign bits,
++// one scale. Whole-sub-block loads keep each row's reads in one place (4 threads x 8 values made 14 scattered
++// 2-byte loads per sub-block and were load-bound).
++struct block_a_prefetch {
++    uvec4 qs;        // 8 low index bytes as 4 x u16
++    uint32_t signs;
++    uint32_t qh_sc;  // qh byte | scale << 8
++    float d;
++};
++
++block_a_prefetch block_a_load(uint ib, uint loadr) {
++    block_a_prefetch blk;
++    const uint ib_k = ib / 8;
++    const uint ib32 = ib % 8;
++    blk.qs = uvec4(data_a_packed16[ib_k].qs[ib32 * 4    ], data_a_packed16[ib_k].qs[ib32 * 4 + 1],
++                   data_a_packed16[ib_k].qs[ib32 * 4 + 2], data_a_packed16[ib_k].qs[ib32 * 4 + 3]);
++    blk.signs = pack32(u16vec2(data_a_packed16[ib_k].signs[ib32 * 2], data_a_packed16[ib_k].signs[ib32 * 2 + 1]));
++    const uint qh = (uint(data_a_packed16[ib_k].qh[ib32 / 2]) >> ((ib32 & 1) * 8)) & 0xFF;
++    const uint sc = (uint(data_a_packed16[ib_k].scales[ib32 / 4]) >> ((ib32 & 3) * 4)) & 0xF;
++    blk.qh_sc = qh | (sc << 8);
++    blk.d = float(data_a_packed16[ib_k].d);
++    return blk;
++}
++
++void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr) {
++    [[unroll]] for (uint l = 0; l < 4; l++) {
++        const uint qs = blk.qs[l];
++        const uint qh = blk.qh_sc >> (2 * l);
++        const uint signs = blk.signs >> (8 * l);
++        const ivec4 vals0 = ivec4(unpack8(iq3s_grid[( qs       & 0xFF) | ((qh & 1) << 8)]));
++        const ivec4 vals1 = ivec4(unpack8(iq3s_grid[((qs >> 8) & 0xFF) | ((qh & 2) << 7)]));
++        const ivec4 m0 = -(ivec4(signs,      signs >> 1, signs >> 2, signs >> 3) & 1);
++        const ivec4 m1 = -(ivec4(signs >> 4, signs >> 5, signs >> 6, signs >> 7) & 1);
++        buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + l * 2    ] = pack32(i8vec4((vals0 ^ m0) - m0));
++        buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + l * 2 + 1] = pack32(i8vec4((vals1 ^ m1) - m1));
++    }
++    buf_a_d[ks * BM + buf_ib] = blk.d * float(1 + 2 * ((blk.qh_sc >> 8) & 0xF));
++}
++
++#elif defined(DATA_A_IQ2_S)
++
++// One thread per 32-value sub-block (LOAD_VEC_A 32): 4 grid indices (10 bits, 8 magnitudes 8/25/43 each),
++// 4 sign bytes, two scales (one per 16 values).
++struct block_a_prefetch {
++    uint32_t qs;     // 4 low index bytes
++    uint32_t signs;  // 4 sign bytes
++    uint32_t qh_sc;  // qh byte | scales byte << 8
++    float d;
++};
++
++block_a_prefetch block_a_load(uint ib, uint loadr) {
++    block_a_prefetch blk;
++    const uint ib_k = ib / 8;
++    const uint ib32 = ib % 8;
++    blk.qs    = pack32(u16vec2(data_a_packed16[ib_k].qs[2 * ib32],      data_a_packed16[ib_k].qs[2 * ib32 + 1]));
++    blk.signs = pack32(u16vec2(data_a_packed16[ib_k].qs[16 + 2 * ib32], data_a_packed16[ib_k].qs[16 + 2 * ib32 + 1]));
++    const uint qh = (uint(data_a_packed16[ib_k].qh[ib32 / 2])     >> ((ib32 & 1) * 8)) & 0xFF;
++    const uint sc = (uint(data_a_packed16[ib_k].scales[ib32 / 2]) >> ((ib32 & 1) * 8)) & 0xFF;
++    blk.qh_sc = qh | (sc << 8);
++    blk.d = float(data_a_packed16[ib_k].d);
++    return blk;
++}
++
++void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr) {
++    [[unroll]] for (uint l = 0; l < 4; l++) {
++        const uint idx = ((blk.qs >> (8 * l)) & 0xFF) | (((blk.qh_sc & 0xFF) << (8 - 2 * l)) & 0x300);
++        const uvec2 g = iq2s_grid[idx];
++        const uint signs = blk.signs >> (8 * l);
++        const ivec4 vals0 = ivec4(unpack8(g.x));
++        const ivec4 vals1 = ivec4(unpack8(g.y));
++        const ivec4 m0 = -(ivec4(signs,      signs >> 1, signs >> 2, signs >> 3) & 1);
++        const ivec4 m1 = -(ivec4(signs >> 4, signs >> 5, signs >> 6, signs >> 7) & 1);
++        buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + l * 2    ] = pack32(i8vec4((vals0 ^ m0) - m0));
++        buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + l * 2 + 1] = pack32(i8vec4((vals1 ^ m1) - m1));
++    }
++    const uint sc = blk.qh_sc >> 8;
++    buf_a_d[(ks * KSCALES    ) * BM + buf_ib] = blk.d * (0.5 + float(sc & 0xF)) * 0.25;
++    buf_a_d[(ks * KSCALES + 1) * BM + buf_ib] = blk.d * (0.5 + float(sc >> 4))  * 0.25;
++}
++
+ #elif defined(DATA_A_NVFP4)
+ 
+ struct block_a_prefetch {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 7597b3d33..bf8e721ed 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -631,7 +631,7 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
+ #endif
+ 
+         if (!f16acc && coopmat && (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "q8_0" || tname == "iq4_nl" || tname == "iq4_xs" || tname == "mxfp4"
+-                     || tname == "q3_k" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k" || tname == "nvfp4")) {
++                     || tname == "q3_k" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k" || tname == "nvfp4" || tname == "iq2_s" || tname == "iq3_s")) {
+             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}}), fp16, coopmat, coopmat2, f16acc);
+         }
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8c60fdc3d..ce29344d6 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12483,7 +12483,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+ 
+ 
+     // GLM-5.3-Flash routed experts (288 experts, top 8): gate/up 4096 -> 2048, down 2048 -> 4096, prefill batch sizes
+-    for (ggml_type type_a : { GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S }) {
++    for (ggml_type type_a : { GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K }) {
+         for (int bs : { 1, 512, 768, 1024, 2048, 4096 }) {
+             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 288, 8, false, 2048, bs, 4096));
+             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 288, 8, false, 4096, bs, 2048));
+-- 
+2.43.0
+

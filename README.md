@@ -1,8 +1,8 @@
 # Halo Tuning
 
-Tuning three large MoE models for local inference on an **AMD Strix Halo** (Ryzen AI Max+ 395, Radeon 8060S / gfx1151,
-128 GB unified memory): **Qwen3.8-Flash-Next** on [Strata](https://github.com/Niko1221/Strata), and **Laguna-S-2.1** and
-**MiMo-V2.6-Flash** on llama.cpp (Vulkan). Every number here was measured on one machine, and every adopted change had to
+Tuning four large MoE models for local inference on an **AMD Strix Halo** (Ryzen AI Max+ 395, Radeon 8060S / gfx1151,
+128 GB unified memory): **Qwen3.8-Flash-Next** on [Strata](https://github.com/Niko1221/Strata), and **Laguna-S-2.1**,
+**MiMo-V2.6-Flash** and **GLM-5.3-Flash** on llama.cpp (Vulkan). Every number here was measured on one machine, and every adopted change had to
 pass the same quality gates (a long-context needle test and a 5-task agentic coding suite).
 
 | Model | Engine | Output tok/s (short → long context) | Prompt tok/s | Quality |
@@ -10,6 +10,7 @@ pass the same quality gates (a long-context needle test and a 5-task agentic cod
 | [Qwen3.8-Flash-Next](qwen-strata/) (125B-A6B, UD-IQ4_XS) | Strata v0.1.41 | **58.5–59.5** @8K, 57–58.6 @32K, 40–44.6 @128K | ~1,000–1,067 | agentic 5/5, needle 15/15 |
 | [Laguna-S-2.1](laguna/) (118B-A8B, Q4 "lean" requant) | llama.cpp Vulkan + [patches](patches/) | 33–34 plain; **code with DFlash 40.6 / 37.5 / 34.0 / 34.9** @1K / 31K / 124K / 235K; 26.4 @128K, 24.2 @245K plain | 611–653 @0, 465 @31K | agentic 5/5, needle 14–15/15 |
 | [MiMo-V2.6-Flash](mimo/) (309B-A15B, BPW2.5 + Q4_K attention) | llama.cpp Vulkan + [patches](patches/) | 30.7–32 plain; **code with DFlash 45–47 / 41–43** @1K / 31K | 323–332 @0, ~240 @32K | agentic 5/5, needle 15/15 |
+| [GLM-5.3-Flash](glm/) (320B-A18B, ~110 GiB requant, KLD 0.043) | llama.cpp Vulkan + [GLM patches](patches/llama.cpp-glm/) | **chat with MTP 28.5–29.6**, code 31–32, ~28 @32K (stock: ~15 without MTP) | 229–233 @2K, 208 @32K, 185–198 on a 60K prompt | agentic 10/10, needle 15/15 |
 
 ## The machine — and why it is not a "max settings" Strix Halo
 
@@ -47,13 +48,14 @@ prompt chunks at 200K+ context). Details: [platform/](platform/).
 
 ## What generalised across models
 
-| Finding | Qwen | Laguna | MiMo |
-|---|---|---|---|
-| Speculative decoding is the biggest single decode lever | MTP, `--spec 5 --mtp-window 8192` (+3–9%) | DFlash with a 1024-token drafter window (the "DFlash collapses past 8K" fix) | DFlash, 4-token drafts |
-| A requant pays only where non-expert weights dominate the bytes per token | — | no (experts dominate) | **yes**: attention Q6_K → Q4_K, +17% decode |
-| Thinking off for agentic work | **no** (one task looped, 4/5) | yes, opt-in (727 s vs 1,632 s; needle 13/15 vs 14/15) | **yes** (923 s vs ~1,900 s typical; needle 15/15) |
-| Serving several requests at once (batch slots) | no aggregate gain; first answers much later | no (+3%) | — |
-| Block-sparse long-context attention | — | **yes** (+35% decode @128K, +61% @245K) | **no** (breaks recall at the same budget) |
+| Finding | Qwen | Laguna | MiMo | GLM |
+|---|---|---|---|---|
+| Speculative decoding is the biggest single decode lever | MTP, `--spec 5 --mtp-window 8192` (+3–9%) | DFlash with a 1024-token drafter window (the "DFlash collapses past 8K" fix) | DFlash, 4-token drafts | MTP, 2-token probabilistic drafts + 64K draft vocab (needed sparse-FA fixes for verify batches) |
+| A requant pays only where non-expert weights dominate the bytes per token | — | no (experts dominate) | **yes**: attention Q6_K → Q4_K, +17% decode | **yes**: attention / KDA / shared / dense Q6_K → Q4_K, +13% decode |
+| Thinking off for agentic work | **no** (one task looped, 4/5) | yes, opt-in (727 s vs 1,632 s; needle 13/15 vs 14/15) | **yes** (923 s vs ~1,900 s typical; needle 15/15) | — (not tested) |
+| Serving several requests at once (batch slots) | no aggregate gain; first answers much later | no (+3%) | — | — (no memory for it) |
+| Block-sparse long-context attention | — | **yes** (+35% decode @128K, +61% @245K) | **no** (breaks recall at the same budget) | built in (DSA); needed dedicated Vulkan kernels |
+| Fewer routed experts | — | no (KLD 1.4–3.7×) | no (KLD 0.022–0.051) | no (KLD 0.059–0.100) |
 
 The last row is a warning: a technique that is free on one model can quietly break another. Gate every model separately.
 
@@ -62,8 +64,11 @@ The last row is a warning: a technique that is free on one model can quietly bre
 - [qwen-strata/](qwen-strata/) — Qwen3.8-Flash-Next on Strata: the v0.1.41 upgrade, the retune, the gap to desktop numbers.
 - [laguna/](laguna/) — Laguna-S-2.1 on llama.cpp: block-sparse decode, KV-sliced prefill, fixing DFlash at depth.
 - [mimo/](mimo/) — MiMo-V2.6-Flash on llama.cpp: the attention requant, speculation, prefill profile, thinking control.
+- [glm/](glm/) — GLM-5.3-Flash on llama.cpp: non-expert requant, MTP with a draft vocabulary, sparse-attention and IQ2_S / IQ3_S
+  kernels, fusions, and a matched ROCm vs Vulkan run.
 - [platform/](platform/) — Strix Halo host settings and lessons that apply to any model.
 - [patches/llama.cpp/](patches/llama.cpp/) — our llama.cpp patch series (Vulkan + speculation + Laguna/MiMo support).
+- [patches/llama.cpp-glm/](patches/llama.cpp-glm/) — the GLM-5.3-Flash series (23 patches on a newer base).
 - [configs/](configs/) — the exact serving configs (paths replaced with `$PLACEHOLDERS`).
 
 ## Reproducibility
@@ -72,6 +77,8 @@ The last row is a warning: a technique that is free on one model can quietly bre
 - **Laguna / MiMo on llama.cpp**: several gains need our [patch series](patches/llama.cpp/) (block-sparse decode, KV-sliced
   prefill, the DFlash drafter window, adaptive speculation pause, the quantize fix). Each model page marks which settings
   work on stock llama.cpp and which need the patches.
+- **GLM on llama.cpp**: `efe3626b1` + the [GLM series](patches/llama.cpp-glm/) reproduces our build exactly. On stock
+  llama.cpp, MTP works, but the sparse-attention, IQ2_S / IQ3_S, verify and fusion speedups need the patches.
 
 ## Community posts
 

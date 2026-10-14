@@ -1,0 +1,32 @@
+From f4c11eaa495daaa41d4799fb794bc9cebb6e601c Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 20:21:40 -0400
+Subject: [PATCH 02/23] llama-quantize: only require an imatrix for tensors
+ that change type
+
+A partial requant of an IQ release (every other tensor pinned to its current type by
+a tensor-type file) copies those tensors, so they need no imatrix.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-quant.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index 9c6066796..1f5cd0475 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -1131,7 +1131,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+             metadata[i].target_type = tensor->type;
+         }
+ 
+-        metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
++        // a tensor that keeps its type is only copied, so it needs no imatrix
++        metadata[i].requires_imatrix = metadata[i].target_type != tensor->type &&
++            tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
+ 
+         if (params->imatrix) {
+             metadata[i].remapped_imatrix_name = remap_imatrix(tensor->name, mapped);
+-- 
+2.43.0
+

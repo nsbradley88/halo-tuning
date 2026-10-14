@@ -1,0 +1,392 @@
+From eb8a60761746db16f20d26fe953340daac9d48c2 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 08:33:19 +0000
+Subject: [PATCH 10/23] vulkan: fuse RMS_NORM + SCALE and SCALE -> SIGMOID ->
+ SCALE
+
+- RMS_NORM_SCALE: rms_norm(x)*c (no bias) as one dispatch; the factor goes in
+  the rms_norm param2 (both the plain and the partials shader). This is the GDN
+  l2 norm (build_gdn_l2_norm), -68 dispatches per glm5-next graph.
+- SCALE_SIGMOID_SCALE: s_out*sigmoid(s_in*x) (no biases) as one unary
+  dispatch, the KDA decay gate lb*sigmoid(-A*g), -68 per graph.
+- Both evaluate the same f32 operations in the same order as the unfused ops.
+- graph_optimize keeps both pairs adjacent (RMS_NORM -> SCALE like
+  RMS_NORM -> MUL; SCALE/SIGMOID/SCALE as a kept pattern).
+- test-backend-ops: RMS_NORM_SCALE, SCALE_SIGMOID_SCALE whole-graph cases.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan-types.h      |  6 ++
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 69 +++++++++++++++++-
+ .../ggml-vulkan/vulkan-shaders/rms_norm.comp  |  7 +-
+ .../vulkan-shaders/rms_norm_partials.comp     |  7 +-
+ .../src/ggml-vulkan/vulkan-shaders/unary.comp |  5 ++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |  1 +
+ tests/test-backend-ops.cpp                    | 72 +++++++++++++++++++
+ 7 files changed, 163 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index 4158ff779..560a86cdb 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -560,6 +560,9 @@ static constexpr std::initializer_list<ggml_op> rope_view_set_rows_pattern { GGM
+ // scale_out*sigmoid(scale_in*x) as the hc_post weights (qwen4exp hc_combine)
+ static constexpr std::initializer_list<ggml_op> hc_post_gate_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
+ 
++// s_out*sigmoid(s_in*x), e.g. the KDA decay gate lb*sigmoid(-A*g)
++static constexpr std::initializer_list<ggml_op> scale_sigmoid_scale_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE };
++
+ static constexpr std::initializer_list<std::array<int, 3>> hc_post_gate_edges {
+     { 1, 0, 0 }, // sigmoid->src[0] == scale
+     { 2, 0, 1 }, // scale->src[0]   == sigmoid
+@@ -643,6 +646,7 @@ enum rms_norm_mode {
+     RMS_NORM_MUL_ROPE,
+     RMS_NORM_MUL_ROPE_VIEW_SET_ROWS,
+     RMS_NORM_VIEW_SET_ROWS,
++    RMS_NORM_SCALE,          // rms_norm(x)*c, the scale factor goes in param2
+     RMS_NORM_COUNT,
+ };
+ 
+@@ -900,6 +904,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_neg[2];
+     vk_pipeline pipeline_tanh[2];
+     vk_pipeline pipeline_sigmoid[2];
++    vk_pipeline pipeline_sigmoid_scaled_f32;
+     vk_pipeline pipeline_hardsigmoid[2];
+     vk_pipeline pipeline_hardswish[2];
+     vk_pipeline pipeline_abs[2];
+@@ -1305,6 +1310,7 @@ struct ggml_backend_vk_context {
+     // QSA indexer gather+add+top_k fused into one radix-select
+     bool fused_topk_qsa {};
+     bool fused_hc_post_gate {};
++    bool fused_scale_sigmoid_scale {};
+     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
+ 
+     // for GGML_VK_PERF_LOGGER
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index d0a8bb2f9..9daee851b 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -3437,6 +3437,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     CREATE_UNARY(neg)
+     CREATE_UNARY(tanh)
+     CREATE_UNARY(sigmoid)
++    ggml_vk_create_pipeline(device, device->pipeline_sigmoid_scaled_f32, "sigmoid_scaled_f32", sigmoid_scaled_f32_len, sigmoid_scaled_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+     CREATE_UNARY(hardsigmoid)
+     CREATE_UNARY(hardswish)
+     CREATE_UNARY(abs)
+@@ -8900,6 +8901,10 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+             (src0->type != dst->type)) {
+             return nullptr;
+         }
++        if (ctx->fused_scale_sigmoid_scale) {
++            // dst is the trailing SCALE node
++            return src0->type == GGML_TYPE_F32 ? ctx->device->pipeline_sigmoid_scaled_f32 : nullptr;
++        }
+ 
+         switch (ggml_get_unary_op(dst)) {
+             case GGML_UNARY_OP_EXP:
+@@ -10897,7 +10902,12 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
+     ggml_tensor * dst;
+     const ggml_tensor * src1;
+ 
+-    if (ctx->fused_rms_norm_mode != RMS_NORM_COUNT) {
++    float post_scale = 0.0f;
++    if (ctx->fused_rms_norm_mode == RMS_NORM_SCALE) {
++        dst = cgraph->nodes[node_idx + 1];
++        src1 = src0;
++        post_scale = ggml_get_op_params_f32(dst, 0);
++    } else if (ctx->fused_rms_norm_mode != RMS_NORM_COUNT) {
+         ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+         dst = mul;
+         src1 = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+@@ -10908,6 +10918,7 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
+ 
+     const uint32_t num_partials = ctx->do_add_rms_partials ? ggml_vk_rms_num_partials(ctx, dst) : 0;
+     vk_op_binary_push_constants bin = ggml_vk_rms_norm_push_constants(src0, src1, dst, op_params[0], num_partials);
++    bin.param2 = post_scale;
+ 
+     if (ctx->fused_rms_norm_mode == RMS_NORM_MUL_ROPE ||
+         ctx->fused_rms_norm_mode == RMS_NORM_MUL_ROPE_VIEW_SET_ROWS) {
+@@ -10990,7 +11001,8 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
+                 ggml_vk_subbuffer(ctx, buf[6], offset[6]),
+             }, pc, elements);
+     } else {
+-        GGML_ASSERT(ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_COUNT);
++        GGML_ASSERT(ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_SCALE ||
++                    ctx->fused_rms_norm_mode == RMS_NORM_COUNT);
+         ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
+     }
+ 
+@@ -12476,6 +12488,12 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
+         if (ctx->fused_hc_post_gate) {
+             ggml_tensor * hc_post = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+             ggml_vk_dsv4_hc_post(ctx, compute_ctx, hc_post->src[0], hc_post->src[1], hc_post->src[2], hc_post->src[3], hc_post, node);
++        } else if (ctx->fused_scale_sigmoid_scale) {
++            ggml_tensor * scale_out = cgraph->nodes[node_idx + 2];
++            vk_op_unary_push_constants p = vk_op_unary_push_constants_init(src0, scale_out);
++            p.param1 = ggml_get_op_params_f32(node, 0);
++            p.param2 = ggml_get_op_params_f32(scale_out, 0);
++            ggml_vk_op_f32(ctx, compute_ctx, src0, nullptr, nullptr, nullptr, scale_out, GGML_OP_UNARY, std::move(p));
+         } else {
+             ggml_vk_scale(ctx, compute_ctx, src0, node);
+         }
+@@ -13556,6 +13574,32 @@ static bool ggml_vk_can_fuse_unary_mul_pair(const struct ggml_cgraph * cgraph, i
+            ggml_vk_can_fuse_unary_mul(cgraph, node_idx, node_idx + 1);
+ }
+ 
++static bool ggml_vk_can_fuse_scale_sigmoid_scale(const struct ggml_cgraph * cgraph, int node_idx) {
++    if (!ggml_can_fuse(cgraph, node_idx, scale_sigmoid_scale_pattern)) {
++        return false;
++    }
++    const ggml_tensor * scale_in  = cgraph->nodes[node_idx];
++    const ggml_tensor * sigmoid   = cgraph->nodes[node_idx + 1];
++    const ggml_tensor * scale_out = cgraph->nodes[node_idx + 2];
++    return ggml_get_unary_op(sigmoid) == GGML_UNARY_OP_SIGMOID &&
++           scale_in->src[0]->type == GGML_TYPE_F32 && scale_in->type == GGML_TYPE_F32 &&
++           sigmoid->type == GGML_TYPE_F32 && scale_out->type == GGML_TYPE_F32 &&
++           ggml_get_op_params_f32(scale_in, 1) == 0.0f && ggml_get_op_params_f32(scale_out, 1) == 0.0f &&
++           ggml_are_same_shape(scale_in->src[0], scale_out) &&
++           ggml_is_contiguous(scale_in->src[0]) && ggml_is_contiguous(scale_out);
++}
++
++static bool ggml_vk_can_fuse_rms_norm_scale(const struct ggml_cgraph * cgraph, int node_idx) {
++    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_RMS_NORM, GGML_OP_SCALE })) {
++        return false;
++    }
++    const ggml_tensor * rms   = cgraph->nodes[node_idx];
++    const ggml_tensor * scale = cgraph->nodes[node_idx + 1];
++    return rms->src[0]->type == GGML_TYPE_F32 && rms->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 &&
++           ggml_are_same_shape(rms, scale) && ggml_is_contiguous(rms) && ggml_is_contiguous(scale) &&
++           ggml_get_op_params_f32(scale, 0) != 0.0f && ggml_get_op_params_f32(scale, 1) == 0.0f;
++}
++
+ static bool ggml_vk_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int node_idx) {
+     const ggml_tensor * scale_in  = cgraph->nodes[node_idx];
+     const ggml_tensor * sigmoid   = cgraph->nodes[node_idx + 1];
+@@ -14486,6 +14530,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         ctx->fused_topk_moe_scale = false;
+         ctx->fused_topk_qsa = false;
+         ctx->fused_hc_post_gate = false;
++        ctx->fused_scale_sigmoid_scale = false;
+         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
+         const char *fusion_string {};
+         bool skip_overlap_check = false;
+@@ -14550,6 +14595,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 ctx->fused_hc_post_gate = true;
+                 fusion_string = "HC_POST_GATE";
+                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
++            } else if (ggml_vk_can_fuse_scale_sigmoid_scale(cgraph, i)) {
++                ctx->num_additional_fused_ops = 2;
++                ctx->fused_scale_sigmoid_scale = true;
++                fusion_string = "SCALE_SIGMOID_SCALE";
++                std::fill_n(op_srcs_fused_elementwise, 3, true);
+             } else if (ggml_vk_can_fuse(ctx, cgraph, i, rms_norm_mul_add_mul_pattern)) {
+                 ctx->num_additional_fused_ops = 3;
+                 ctx->fused_rms_norm_mode = RMS_NORM_MUL_ADD_MUL;
+@@ -14575,6 +14625,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 // they are overwritten, and one workgroup per row. So close enough.
+                 op_srcs_fused_elementwise[0] = true;
+                 op_srcs_fused_elementwise[1] = true;
++            } else if (ggml_vk_can_fuse_rms_norm_scale(cgraph, i)) {
++                // e.g. the GDN l2 norm: scale(rms_norm(x, eps/n), 1/sqrt(n))
++                ctx->num_additional_fused_ops = 1;
++                ctx->fused_rms_norm_mode = RMS_NORM_SCALE;
++                fusion_string = "RMS_NORM_SCALE";
++                op_srcs_fused_elementwise[0] = true;
++                op_srcs_fused_elementwise[1] = true;
+             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL })) {
+                 ctx->num_additional_fused_ops = 1;
+                 switch (ggml_get_unary_op(cgraph->nodes[i])) {
+@@ -14737,6 +14794,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 ctx->fused_topk_moe_scale = false;
+                 ctx->fused_topk_qsa = false;
+                 ctx->fused_hc_post_gate = false;
++                ctx->fused_scale_sigmoid_scale = false;
+                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
+                 fusion_string = nullptr;
+             }
+@@ -15048,6 +15106,11 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph,
+             keep_pattern(hc_post_gate_pattern);
+             continue;
+         }
++        if (match_pattern(scale_sigmoid_scale_pattern, first_unused) &&
++            ggml_vk_can_fuse_scale_sigmoid_scale(graph, first_unused)) {
++            keep_pattern(scale_sigmoid_scale_pattern);
++            continue;
++        }
+ 
+         // GATED_DELTA_NET + views + snapshot CPY: keep them together so the CPY can be fused into the op.
+         // The views in between must only depend on the GDN or on already scheduled/leaf tensors.
+@@ -15108,6 +15171,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph,
+                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
+                 match_pattern(rope_view_set_rows_pattern, j) ||
+                 match_pattern(hc_post_gate_pattern, j) ||
++                (match_pattern(scale_sigmoid_scale_pattern, j) && ggml_vk_can_fuse_scale_sigmoid_scale(graph, j)) ||
+                 gdn_cpy_dist(j) > 0 ||
+                 defer_unary_for_mul(j)) {
+                 continue;
+@@ -15117,6 +15181,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph,
+                 if (!used[c] &&
+                     is_src_of(graph->nodes[j], graph->nodes[c]) &&
+                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
++                    !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_SCALE && empty_or_scheduled_between(c+1, j)) &&
+                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
+                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
+                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm.comp b/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm.comp
+index 314c8e565..b6078280f 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm.comp
+@@ -138,7 +138,12 @@ void rms_norm(uint num_iters) {
+                     if (col >= ncols) {
+                         continue;
+                     }
+-                    data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
++                    FLOAT_TYPE value = scale * FLOAT_TYPE(data_a[a_offset + col]);
++                    // fused RMS_NORM + SCALE (param2 == 0: no scale)
++                    if (p.param2 != 0.0f) {
++                        value *= FLOAT_TYPE(p.param2);
++                    }
++                    data_d[d_offset + col] = D_TYPE(value);
+                 }
+             }
+ #if RMS_NORM_ROPE_FUSION
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm_partials.comp b/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm_partials.comp
+index cf7ab21f2..6663a1300 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm_partials.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm_partials.comp
+@@ -82,6 +82,11 @@ void main() {
+             data_d[d_offset + col] = D_TYPE(value);
+         }
+     } else {
+-        data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
++        FLOAT_TYPE value = scale * FLOAT_TYPE(data_a[a_offset + col]);
++                    // fused RMS_NORM + SCALE (param2 == 0: no scale)
++                    if (p.param2 != 0.0f) {
++                        value *= FLOAT_TYPE(p.param2);
++                    }
++                    data_d[d_offset + col] = D_TYPE(value);
+     }
+ }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/unary.comp b/ggml/src/ggml-vulkan/vulkan-shaders/unary.comp
+index 9ee7769ba..223143bbb 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/unary.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/unary.comp
+@@ -75,6 +75,11 @@ float op_sigmoid(float x) {
+     return 1.0f / (1.0f + exp(-x));
+ }
+ 
++// fused SCALE -> SIGMOID -> SCALE (no biases): param2 * sigmoid(param1 * x)
++float op_sigmoid_scaled(float x) {
++    return op_sigmoid(x * p.param1) * p.param2;
++}
++
+ float op_gelu(float x) {
+     const float GELU_COEF_A    = 0.044715f;
+     const float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index bf8e721ed..96cd49dac 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -1000,6 +1000,7 @@ void process_shaders() {
+     string_to_spv("tanh_f32",       "unary.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"},     {"OP", "op_tanh"}});
+     string_to_spv("sigmoid_f16",    "unary.comp",       {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}, {"OP", "op_sigmoid"}});
+     string_to_spv("sigmoid_f32",    "unary.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"},     {"OP", "op_sigmoid"}});
++    string_to_spv("sigmoid_scaled_f32", "unary.comp",   {{"A_TYPE", "float"},       {"D_TYPE", "float"},     {"OP", "op_sigmoid_scaled"}});
+     string_to_spv("hardsigmoid_f16","unary.comp",       {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}, {"OP", "op_hardsigmoid"}});
+     string_to_spv("hardsigmoid_f32","unary.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"},     {"OP", "op_hardsigmoid"}});
+     string_to_spv("hardswish_f16",  "unary.comp",       {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}, {"OP", "op_hardswish"}});
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 99a294598..7212300f6 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5171,6 +5171,70 @@ struct test_gated_delta_net_ids_cache : public test_case {
+     }
+ };
+ 
++// GGML_OP_RMS_NORM + GGML_OP_SCALE (the GDN l2 norm, fused on Vulkan)
++struct test_rms_norm_scale : public test_case {
++    const std::array<int64_t, 4> ne;
++    const float eps;
++    const float s;
++
++    std::string vars() override {
++        return VARS_TO_STR3(ne, eps, s);
++    }
++
++    test_rms_norm_scale(std::array<int64_t, 4> ne = {128, 64, 3, 1}, float eps = 1e-6f/128, float s = 0.08838834764831845f)
++        : ne(ne), eps(eps), s(s) {}
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "RMS_NORM_SCALE";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_set_name(a, "a");
++        return ggml_scale(ctx, ggml_rms_norm(ctx, a, eps), s);
++    }
++};
++
++// GGML_OP_SCALE + GGML_OP_UNARY(SIGMOID) + GGML_OP_SCALE (the KDA decay gate, fused on Vulkan)
++struct test_scale_sigmoid_scale : public test_case {
++    const std::array<int64_t, 4> ne;
++    const float s_in;
++    const float s_out;
++
++    std::string vars() override {
++        return VARS_TO_STR3(ne, s_in, s_out);
++    }
++
++    test_scale_sigmoid_scale(std::array<int64_t, 4> ne = {128, 64, 3, 1}, float s_in = -1.0f, float s_out = -5.0f)
++        : ne(ne), s_in(s_in), s_out(s_out) {}
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "SCALE_SIGMOID_SCALE";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_set_name(a, "a");
++        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_set_name(b, "b");
++        // a producer in front, like the KDA gate's MUL by A
++        ggml_tensor * x = ggml_mul(ctx, a, b);
++        return ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, x, s_in)), s_out);
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            init_tensor_uniform(t, -5.0f, 5.0f);
++        }
++    }
++};
++
+ // glm5-next small-ubatch KDA conv: Q/K/V conv windows concatenated once, three SSM_CONV(+SILU) on channel views
+ struct test_glm5_conv_qkv : public test_case {
+     const int64_t d_inner;
+@@ -12089,6 +12153,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_glm5_conv_qkv(8192, n_tok, 1));
+     }
+     test_cases.emplace_back(new test_glm5_conv_qkv(256, 3, 2));
++    for (int64_t n_tok : { 1, 3, 7 }) {
++        test_cases.emplace_back(new test_rms_norm_scale({128, 64, n_tok, 1}));
++    }
++    test_cases.emplace_back(new test_rms_norm_scale({4096, 3, 1, 1}, 1e-5f, 2.0f));
++    for (int64_t n_tok : { 1, 3, 7 }) {
++        test_cases.emplace_back(new test_scale_sigmoid_scale({128, 64, n_tok, 1}));
++    }
++    test_cases.emplace_back(new test_scale_sigmoid_scale({1000, 3, 1, 1}, 2.0f, 0.5f));
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
+-- 
+2.43.0
+

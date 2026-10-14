@@ -1,0 +1,55 @@
+From 358e3a1ed0a0980c5472d73738c5f5de8d8d5798 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 09:29:14 +0000
+Subject: [PATCH 18/23] vulkan: RDNA3 mul_mat_vec workgroup heuristic (four
+ subgroups for few-row and long-row matrices)
+
+Cold-cache timings on Radeon 8060S (gfx1151), GLM-5.3-Flash shapes: f16 router m=288 k=4096 23.4 -> 17.3 us
+(n=1) and 27.0 -> 19.7 us (n=3); f32 router n=3 33.4 -> 25.0 us; q8_0 m=24 k=16384 8.2 -> 7.0 us;
+q4_K m=4096 k=16384 189 -> 172 us, k=12288 136 -> 130 us, k=8192 94.7 -> 87.5 us (n=1);
+q6_K m=4096 k=8192 133 -> 124 us. Overridable with GGML_VK_DMMV_LARGE_MAX_M / GGML_VK_DMMV_LARGE_MIN_K.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit ea7571f42e265b28718a2ce2a10fe8cbd2bf9c61)
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index a6c7f87fc..2021c8ab7 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -4941,8 +4941,10 @@ vk_device ggml_vk_get_device(size_t idx) {
+ 
+         device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
+         device->disable_batched_mmv = getenv("GGML_VK_DISABLE_BATCHED_MMV") != nullptr;
+-        device->dmmv_large_max_m = getenv("GGML_VK_DMMV_LARGE_MAX_M") ? (uint32_t) std::stoul(getenv("GGML_VK_DMMV_LARGE_MAX_M")) : 0;
+-        device->dmmv_large_min_k = getenv("GGML_VK_DMMV_LARGE_MIN_K") ? (uint32_t) std::stoul(getenv("GGML_VK_DMMV_LARGE_MIN_K")) : UINT32_MAX;
++        // AMD workgroup-size heuristic for mul_mat_vec (see ggml_vk_get_dequantize_mul_mat_vec), tuned on RDNA3
++        const bool large_wg_default = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3;
++        device->dmmv_large_max_m = getenv("GGML_VK_DMMV_LARGE_MAX_M") ? (uint32_t) std::stoul(getenv("GGML_VK_DMMV_LARGE_MAX_M")) : (large_wg_default ? 1024 : 0);
++        device->dmmv_large_min_k = getenv("GGML_VK_DMMV_LARGE_MIN_K") ? (uint32_t) std::stoul(getenv("GGML_VK_DMMV_LARGE_MIN_K")) : (large_wg_default ? 8192 : UINT32_MAX);
+ 
+         device->disable_descriptor_reuse = getenv("GGML_VK_DISABLE_DESCRIPTOR_REUSE") != nullptr;
+ 
+@@ -5633,10 +5635,14 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+         }
+     }
+ 
+-    // AMD: four subgroups per row when a matrix has few rows (too few subgroups in flight to cover the memory
+-    // latency; f32 one-column excepted, it is slower there) or long rows at a moderate row count.
++    // AMD RDNA3: four subgroups per row when a matrix has few rows (too few subgroups in flight to cover the
++    // memory latency), or long rows at a moderate row count. Measured cold-cache on Radeon 8060S (gfx1151) with
++    // the GLM-5.3-Flash decode shapes: f16 router m=288 k=4096 23.4 -> 17.3 us (n=1), q8_0 m=24 k=16384
++    // 8.2 -> 7.0 us, q4_K m=4096 k=16384 189 -> 172 us; the exclusions were slower.
+     if (ctx->device->vendor_id == VK_VENDOR_ID_AMD) {
+-        const bool few_rows  = m <= ctx->device->dmmv_large_max_m && k >= 1024 && !(a_type == GGML_TYPE_F32 && num_cols == 1);
++        const bool few_rows  = m <= ctx->device->dmmv_large_max_m && k >= 1024 &&
++                               !(a_type == GGML_TYPE_F32 && num_cols == 1) &&
++                               !(ggml_is_quantized(a_type) && num_cols > 1 && m >= 64);
+         const bool long_rows = m <= 4096 && k >= ctx->device->dmmv_large_min_k && num_cols <= 3;
+         if (few_rows || long_rows) {
+             dmmv_wg = DMMV_WG_SIZE_LARGE;
+-- 
+2.43.0
+

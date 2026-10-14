@@ -1,0 +1,1406 @@
+From 984a9e0dbdc4c5728d8360d2d9f0f43bae8ca5b4 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 15:09:56 +0000
+Subject: [PATCH 21/23] glm5-next: KDA prologue in the gated delta net op,
+ split-K hc_fn matvec
+
+KDA (n_seq_tokens <= 8, state read through ids): ggml_gated_delta_net_set_kda_prologue
+moves the q/k l2 norms, the decay gate lb*sigmoid(-(g + dt_b)*A) and the beta
+sigmoid into the GDN op (src[7] = A, src[8] = dt_b), same f32 operations as the
+graph; the CPU reference is bit-identical to the unfused chain. -6 dispatches per
+KDA layer at n=3 (RMS_NORM_SCALE x2, ADD, MUL, SCALE_SIGMOID_SCALE, SIGMOID).
+LLAMA_KDA_PROLOGUE=0 restores the separate ops.
+
+mHC hc_fn (24 rows, k 16384): for <= 8 tokens the q8_0 matvec runs as
+GGML_OP_DSV4_HC_MIX_PARTIALS, one workgroup per 512-element K slice (and 8
+tokens), writing per-slice partial dot products plus the slice's sum of squares;
+DSV4_HC_PRE_MIX sums the slices and takes r from the summed squares, so there is
+no extra reduce dispatch. LLAMA_HC_MIX_SPLIT=0 keeps the plain matvec.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/include/ggml.h                           |  24 ++++
+ ggml/src/ggml-backend-meta.cpp                |   3 +-
+ ggml/src/ggml-cpu/ggml-cpu.c                  |   8 +-
+ ggml/src/ggml-cpu/ops.cpp                     | 120 +++++++++++++++++-
+ ggml/src/ggml-cpu/ops.h                       |   1 +
+ ggml/src/ggml-vulkan/ggml-vulkan-common.h     |   1 +
+ ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp    |   2 +
+ .../ggml-vulkan/ggml-vulkan-push-constants.h  |  15 +++
+ ggml/src/ggml-vulkan/ggml-vulkan-types.h      |   1 +
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          |  59 ++++++++-
+ .../vulkan-shaders/dsv4_hc_mix_partials.comp  | 112 ++++++++++++++++
+ .../vulkan-shaders/dsv4_hc_pre_mix.comp       |  49 ++++++-
+ .../vulkan-shaders/gated_delta_net.comp       |  40 +++++-
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |   1 +
+ ggml/src/ggml.c                               |  77 ++++++++++-
+ src/llama-context.cpp                         |   4 +
+ src/llama-cparams.h                           |   4 +-
+ src/models/delta-net-base.cpp                 |   9 +-
+ src/models/glm5-next.cpp                      | 105 ++++++++++-----
+ src/models/models.h                           |  11 +-
+ tests/test-backend-ops.cpp                    | 101 ++++++++++++---
+ 21 files changed, 672 insertions(+), 75 deletions(-)
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_mix_partials.comp
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 9123e609d..6bf41b3ea 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -586,6 +586,7 @@ extern "C" {
+         GGML_OP_DSV4_HC_PRE,
+         GGML_OP_DSV4_HC_POST,
+         GGML_OP_DSV4_HC_PRE_MIX,
++        GGML_OP_DSV4_HC_MIX_PARTIALS,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2674,6 +2675,18 @@ extern "C" {
+             struct ggml_tensor  * ids,
+             int64_t               K);
+ 
++    // KDA prologue folded into a gated_delta_net_ids node (returns gdn). q and k are then raw and are L2-normalized
++    // per head inside the op, g is the raw gate pre-activation and beta is pre-sigmoid:
++    //   q, k   <- x * 1/sqrt(sum(x^2) + l2_eps) over S_k        (== ggml_scale(ggml_rms_norm(x, l2_eps/S_k), 1/sqrt(S_k)))
++    //   g      <- lb * sigmoid(-((g + dt_b[i, h]) * A[h]))      A: [H], dt_b: [S_v*H]   (needs the KDA gate [S_v, H, T, B])
++    //   beta   <- sigmoid(beta)
++    GGML_API struct ggml_tensor * ggml_gated_delta_net_set_kda_prologue(
++            struct ggml_tensor  * gdn,
++            struct ggml_tensor  * A,
++            struct ggml_tensor  * dt_b,
++            float                 lb,
++            float                 l2_eps);
++
+     // DSA lightning indexer
+     //
+     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
+@@ -2753,6 +2766,17 @@ extern "C" {
+             int32_t               n_iter,
+             bool                  fold_rms);
+ 
++    // hc_mix_partials: split-K hc_fn matvec for few tokens, reduced by ggml_dsv4_hc_pre_mix:
++    //   hc_fn [K, m] (q8_0, m <= 31), x [n_embd, hc, n_tokens] with K = hc*n_embd, K % (32*n_split) == 0
++    //   -> [32, n_tokens, n_split]: for slice p of K/n_split elements, rows 0..m-1 hold the partial dot
++    //      products hc_fn[:, i] . x[slice p], row m the partial sum of squares of x[slice p], the rest 0.
++    // ggml_dsv4_hc_pre_mix sums the slices (mixes = sum_p, and with fold_rms r from the summed squares).
++    GGML_API struct ggml_tensor * ggml_dsv4_hc_mix_partials(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * hc_fn,
++            struct ggml_tensor  * x,
++            int32_t               n_split);
++
+     GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_mix_y   (struct ggml_context * ctx, struct ggml_tensor * pre_mix);
+     GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_mix_post(struct ggml_context * ctx, struct ggml_tensor * pre_mix);
+     GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_mix_comb(struct ggml_context * ctx, struct ggml_tensor * pre_mix);
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 8d9afa7de..197cc88cc 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1047,7 +1047,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             case GGML_OP_DSV4_HC_COMB:
+             case GGML_OP_DSV4_HC_PRE:
+             case GGML_OP_DSV4_HC_POST:
+-            case GGML_OP_DSV4_HC_PRE_MIX: {
++            case GGML_OP_DSV4_HC_PRE_MIX:
++            case GGML_OP_DSV4_HC_MIX_PARTIALS: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+             } break;
+             case GGML_OP_UNARY: {
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index ed16da1ad..fab58b3a7 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2109,6 +2109,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_dsv4_hc_pre_mix(params, tensor);
+             } break;
++        case GGML_OP_DSV4_HC_MIX_PARTIALS:
++            {
++                ggml_compute_forward_dsv4_hc_mix_partials(params, tensor);
++            } break;
+         case GGML_OP_MAP_CUSTOM1:
+             {
+                 ggml_compute_forward_map_custom1(params, tensor);
+@@ -2293,6 +2297,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_DSV4_HC_PRE:
+         case GGML_OP_DSV4_HC_POST:
+         case GGML_OP_DSV4_HC_PRE_MIX:
++        case GGML_OP_DSV4_HC_MIX_PARTIALS:
+             {
+                 n_tasks = n_threads;
+             } break;
+@@ -3031,7 +3036,8 @@ struct ggml_cplan ggml_graph_plan(
+                     {
+                         const int64_t S_v = node->src[2]->ne[0];
+                         const int64_t K   = ggml_get_op_params_i32(node, 0);
+-                        const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
++                        const bool    pro = ggml_get_op_params_i32(node, 1) != 0;
++                        const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0) + (pro ? 3 * S_v : 0);
+                         cur = per_thread * sizeof(float) * n_tasks;
+                     } break;
+                 case GGML_OP_COUNT:
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 1e2595f4c..7d7f760b2 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11168,11 +11168,22 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+     // with ids, the row stride of the states tensor
+     const int64_t state_seq_stride = (src_ids ? src_state->nb[1] : src_state->nb[3]) / sizeof(float);
+ 
+-    const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
++    // KDA prologue (ggml_gated_delta_net_set_kda_prologue): raw q/k/g/beta, normalized and activated here
++    const bool    prologue = ggml_get_op_params_i32(dst, 1) != 0;
++    const float   pro_lb   = ggml_get_op_params_f32(dst, 2);
++    const float   pro_eps  = ggml_get_op_params_f32(dst, 3);
++    const float * pro_A    = prologue ? (const float *) dst->src[7]->data : nullptr;
++    const float * pro_dtb  = prologue ? (const float *) dst->src[8]->data : nullptr;
++    GGML_ASSERT(!prologue || kda);
++
++    const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0) + (prologue ? 3 * S_v : 0);
+     const int ith = params->ith;
+ 
+     float * delta       = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
+     float * state_work  = K > 1 ? (delta + S_v) : nullptr;
++    float * pro_q       = prologue ? delta + S_v + (K > 1 ? S_v * S_v : 0) : nullptr;
++    float * pro_k       = prologue ? pro_q + S_v : nullptr;
++    float * pro_g       = prologue ? pro_k + S_v : nullptr;
+ 
+     // output layout: [attn_scores | new_states]
+     // attn_scores: S_v * H * n_tokens * n_seqs    floats
+@@ -11224,9 +11235,32 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+             const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
+             const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
+ 
+-            const float beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
++            float beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
+             const float * g_d    =  (const float *)((const char *)src_g->data    + iv3 * nbg3 + t * nbg2 + iv1 * nbg1);
+ 
++            if (prologue) {
++                // same ops as build_gdn_l2_norm: rms_norm(x, eps/n) * 1/sqrt(n)
++                const float n = (float) S_v;
++                ggml_float sq = 0.0, sk = 0.0;
++                for (int64_t i = 0; i < S_v; ++i) {
++                    sq += (ggml_float)(q_d[i]*q_d[i]);
++                    sk += (ggml_float)(k_d[i]*k_d[i]);
++                }
++                const float fq = 1.0f/sqrtf((float)(sq/S_v) + pro_eps/n);
++                const float fk = 1.0f/sqrtf((float)(sk/S_v) + pro_eps/n);
++                const float inv_sqrt_n = 1.0f/sqrtf(n);
++                for (int64_t i = 0; i < S_v; ++i) {
++                    pro_q[i] = (q_d[i]*fq)*inv_sqrt_n;
++                    pro_k[i] = (k_d[i]*fk)*inv_sqrt_n;
++                    const float u = (g_d[i] + pro_dtb[iv1*S_v + i]) * pro_A[iv1];
++                    pro_g[i] = pro_lb * (1.0f/(1.0f + expf(u)));
++                }
++                q_d = pro_q;
++                k_d = pro_k;
++                g_d = pro_g;
++                beta_val = 1.0f/(1.0f + expf(-beta_val));
++            }
++
+             // state is stored transposed: s_out[j*S_v + i] = S[i][j]
+             // so row j of s_out = column j of S (contiguous access)
+ 
+@@ -11581,6 +11615,9 @@ static void ggml_compute_forward_dsv4_hc_pre_mix_f32(
+     const float   hc_eps   = ggml_get_op_params_f32(dst, 2);
+     const int32_t n_iter   = ggml_get_op_params_i32(dst, 3);
+     const bool    fold_rms = ggml_get_op_params_i32(dst, 4) != 0;
++    const bool    partials = ggml_get_op_params_i32(dst, 7) != 0; // mixes = ggml_dsv4_hc_mix_partials [32, n_tokens, n_split]
++    const int64_t n_split  = partials ? mixes->ne[2] : 1;
++    const int64_t m_mix    = (2 + hc)*hc;
+ 
+     GGML_TENSOR_LOCALS(size_t, nbx, x,     nb);
+     GGML_TENSOR_LOCALS(size_t, nbm, mixes, nb);
+@@ -11601,9 +11638,23 @@ static void ggml_compute_forward_dsv4_hc_pre_mix_f32(
+     for (int64_t it = it0; it < it1; ++it) {
+         const char * xt = (const char *) x->data + it*nbx2;
+ 
++        // split-K partials: sum the slices in order (row m_mix holds the slice's sum of squares)
++        float msum[tail];
++        if (partials) {
++            for (int64_t i = 0; i <= m_mix; ++i) {
++                float acc = 0.0f;
++                for (int64_t p = 0; p < n_split; ++p) {
++                    acc += *(const float *) ((const char *) mixes->data + i*nbm0 + it*nbm1 + p*nbm2);
++                }
++                msum[i] = acc;
++            }
++        }
++
+         // flat rms factor over all hc*n_embd values (same as ggml_rms_norm of the flat row)
+         float r = 1.0f;
+-        if (fold_rms) {
++        if (fold_rms && partials) {
++            r = 1.0f/sqrtf(msum[m_mix]/(hc*n_embd) + rms_eps);
++        } else if (fold_rms) {
+             ggml_float sum = 0.0;
+             for (int64_t ih = 0; ih < hc; ++ih) {
+                 for (int64_t i0 = 0; i0 < n_embd; ++i0) {
+@@ -11616,7 +11667,7 @@ static void ggml_compute_forward_dsv4_hc_pre_mix_f32(
+         }
+ 
+         auto mix = [&](int64_t i) {
+-            return *(const float *) ((const char *) mixes->data + i*nbm0 + it*nbm1) * r;
++            return (partials ? msum[i] : *(const float *) ((const char *) mixes->data + i*nbm0 + it*nbm1)) * r;
+         };
+ 
+         float * tl = d + n_embd*n_tokens + it*tail;
+@@ -11684,6 +11735,67 @@ static void ggml_compute_forward_dsv4_hc_pre_mix_f32(
+     }
+ }
+ 
++// ggml_compute_forward_dsv4_hc_mix_partials
++
++void ggml_compute_forward_dsv4_hc_mix_partials(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * a = dst->src[0]; // hc_fn [K, m] q8_0
++    const ggml_tensor * x = dst->src[1]; // [n_embd, hc, n_tokens]
++
++    GGML_ASSERT(a->type == GGML_TYPE_Q8_0 && x->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(x));
++
++    constexpr int64_t tail = 32;
++    constexpr int64_t qk   = 32; // QK8_0
++
++    const int64_t K        = a->ne[0];
++    const int64_t m        = a->ne[1];
++    const int64_t n_tokens = x->ne[2];
++    const int64_t n_split  = ggml_get_op_params_i32(dst, 0);
++    const int64_t slice    = K / n_split;
++
++    struct blk_q8_0 { ggml_fp16_t d; int8_t qs[32]; }; // block_q8_0
++    static_assert(sizeof(blk_q8_0) == 34, "unexpected q8_0 block size");
++    const blk_q8_0 * wa = (const blk_q8_0 *) a->data;
++    const float      * xd = (const float *) x->data;
++    float            * d  = (float *) dst->data;
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    // one (slice, token) pair per job; same summation order as the Vulkan shader:
++    // per block sum(q*x) * d, then the blocks of the slice in order
++    for (int64_t job = ith; job < n_split*n_tokens; job += nth) {
++        const int64_t p  = job / n_tokens;
++        const int64_t it = job % n_tokens;
++        const float * xs = xd + it*K + p*slice;
++        float * out = d + (p*n_tokens + it)*tail;
++
++        for (int64_t row = 0; row < m; ++row) {
++            float acc = 0.0f;
++            for (int64_t b = 0; b < slice/qk; ++b) {
++                const blk_q8_0 * blk = wa + row*(K/qk) + p*(slice/qk) + b;
++                float s = 0.0f;
++                for (int64_t j = 0; j < qk; ++j) {
++                    s += (float) blk->qs[j] * xs[b*qk + j];
++                }
++                acc += s * GGML_CPU_FP16_TO_FP32(blk->d);
++            }
++            out[row] = acc;
++        }
++
++        float ss = 0.0f;
++        for (int64_t j = 0; j < slice; ++j) {
++            ss += xs[j]*xs[j];
++        }
++        out[m] = ss;
++        for (int64_t i = m + 1; i < tail; ++i) {
++            out[i] = 0.0f;
++        }
++    }
++}
++
+ void ggml_compute_forward_dsv4_hc_pre_mix(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 04b205e51..714e0f42b 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -109,6 +109,7 @@ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params
+ void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_pre_mix(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_dsv4_hc_mix_partials(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-common.h b/ggml/src/ggml-vulkan/ggml-vulkan-common.h
+index 982a8cf6d..fb1e3e763 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-common.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-common.h
+@@ -101,6 +101,7 @@ vk_pipeline ggml_vk_get_quantize_pipeline(ggml_backend_vk_context * ctx, ggml_ty
+ void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t ne);
+ void ggml_vk_dsv4_hc_comb(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * mixes, const ggml_tensor * scale, const ggml_tensor * base, ggml_tensor * dst);
+ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * x, const ggml_tensor * weights, ggml_tensor * dst);
++void ggml_vk_dsv4_hc_mix_partials(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst);
+ void ggml_vk_dsv4_hc_pre_mix(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst);
+ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * x, const ggml_tensor * residual, const ggml_tensor * post, const ggml_tensor * comb, ggml_tensor * dst, const ggml_tensor * gate_scale_in = nullptr);
+ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp b/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
+index 51cc018d8..5944c3898 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
+@@ -1202,6 +1202,8 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
+             }
+         } else if (tensor->op == GGML_OP_DSV4_HC_POST) {
+             tensor_clone = ggml_dsv4_hc_post(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
++        } else if (tensor->op == GGML_OP_DSV4_HC_MIX_PARTIALS) {
++            tensor_clone = ggml_dsv4_hc_mix_partials(ggml_ctx, src_clone[0], src_clone[1], ggml_get_op_params_i32(tensor, 0));
+         } else if (tensor->op == GGML_OP_DSV4_HC_PRE_MIX) {
+             tensor_clone = ggml_dsv4_hc_pre_mix(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3], src_clone[4],
+                     ggml_get_op_params_f32(tensor, 0), ggml_get_op_params_f32(tensor, 1), ggml_get_op_params_f32(tensor, 2),
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+index a1b9de4a2..7e68a5560 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+@@ -211,6 +211,18 @@ struct vk_op_dsv4_hc_pre_mix_push_constants {
+     float    hc_eps;
+     uint32_t n_iter;
+     uint32_t fold_rms;
++    uint32_t n_split;
++    uint32_t nbm2;
++};
++
++struct vk_op_dsv4_hc_mix_partials_push_constants {
++    uint32_t m;
++    uint32_t k;
++    uint32_t n_tokens;
++    uint32_t n_split;
++    uint32_t a_offset;
++    uint32_t x_offset;
++    uint32_t d_offset;
+ };
+ 
+ struct vk_op_dsv4_hc_post_push_constants {
+@@ -730,6 +742,9 @@ struct vk_op_gated_delta_net_push_constants {
+     uint32_t cache_out;        // snapshots go straight to the recurrent cache (fused GDN -> CPY)
+     uint32_t cache_seq_stride; // floats between the cache rows of two seqs
+     uint32_t cache_slot_stride;// floats between two snapshot slots (rollback groups) in the cache
++    uint32_t prologue;         // KDA prologue folded in (ggml_gated_delta_net_set_kda_prologue)
++    float    pro_lb;
++    float    pro_l2_eps;
+ };
+ 
+ static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index c2f9b3cbf..423376334 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -973,6 +973,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
+     vk_pipeline pipeline_dsv4_hc_pre_mix_f32;
+     vk_pipeline pipeline_dsv4_hc_pre_mix_vec4_f32;
++    vk_pipeline pipeline_dsv4_hc_mix_partials_q8_0;
+     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
+     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
+     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 86b93b1e4..119f378fe 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -3632,6 +3632,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         device->subgroup_size >= 16 && 1024 / device->subgroup_size >= 2) {
+         ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_mix_f32,      "dsv4_hc_pre_mix_f32",      dsv4_hc_pre_mix_f32_len, dsv4_hc_pre_mix_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_pre_mix_push_constants), {1, 1, 1}, { 1024, device->subgroup_size, 0 }, 1, true, true, device->subgroup_size);
+         ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_mix_vec4_f32, "dsv4_hc_pre_mix_vec4_f32", dsv4_hc_pre_mix_f32_len, dsv4_hc_pre_mix_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_pre_mix_push_constants), {1, 1, 1}, { 1024, device->subgroup_size, 1 }, 1, true, true, device->subgroup_size);
++        ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_mix_partials_q8_0, "dsv4_hc_mix_partials_q8_0", dsv4_hc_mix_partials_q8_0_len, dsv4_hc_mix_partials_q8_0_data, "main", 3, sizeof(vk_op_dsv4_hc_mix_partials_push_constants), {1, 1, 1}, { 256 }, 1);
+     }
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,        "dsv4_hc_pre_f32",        dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
+@@ -3763,7 +3764,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+             for (uint32_t kda = 0; kda < 2; kda++) {
+                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
+-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 9, sizeof(vk_op_gated_delta_net_push_constants),
++                    gdn_names[si][kda], gdn_len, gdn_data, "main", 11, sizeof(vk_op_gated_delta_net_push_constants),
+                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
+             }
+         }
+@@ -7272,6 +7273,32 @@ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, cons
+     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, w_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
+ }
+ 
++void ggml_vk_dsv4_hc_mix_partials(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++    const ggml_tensor * a = dst->src[0];
++    const ggml_tensor * x = dst->src[1];
++    VK_LOG_DEBUG("ggml_vk_dsv4_hc_mix_partials(" << a << ", " << x << ", " << dst << ")");
++
++    vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_mix_partials_q8_0;
++    GGML_ASSERT(pipeline != nullptr);
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++
++    const uint32_t n_tokens = (uint32_t)x->ne[2];
++    const uint32_t n_split  = (uint32_t)ggml_get_op_params_i32(dst, 0);
++
++    const vk_subbuffer a_buf = ggml_vk_tensor_subbuffer(ctx, a,   true);
++    const vk_subbuffer x_buf = ggml_vk_tensor_subbuffer(ctx, x,   true);
++    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
++
++    vk_op_dsv4_hc_mix_partials_push_constants pc = {
++        (uint32_t)a->ne[1], (uint32_t)a->ne[0], n_tokens, n_split,
++        get_misalign_bytes(ctx, a) / (uint32_t)ggml_type_size(a->type),
++        get_misalign_bytes(ctx, x) / (uint32_t)sizeof(float),
++        get_misalign_bytes(ctx, dst) / (uint32_t)sizeof(float),
++    };
++
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a_buf, x_buf, d_buf }, pc, { n_split, CEIL_DIV(n_tokens, 8u), 1 });
++}
++
+ void ggml_vk_dsv4_hc_pre_mix(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+     const ggml_tensor * x      = dst->src[0];
+     const ggml_tensor * mixes  = dst->src[1];
+@@ -7302,6 +7329,8 @@ void ggml_vk_dsv4_hc_pre_mix(ggml_backend_vk_context * ctx, vk_context& subctx,
+         ggml_get_op_params_f32(dst, 2),
+         (uint32_t)ggml_get_op_params_i32(dst, 3),
+         (uint32_t)ggml_get_op_params_i32(dst, 4),
++        ggml_get_op_params_i32(dst, 7) != 0 ? (uint32_t)mixes->ne[2] : 0u,
++        ggml_vk_nb_elem(mixes, 2),
+     };
+     pc.x_offset = get_misalign_bytes(ctx, x)      / sizeof(float);
+     pc.m_offset = get_misalign_bytes(ctx, mixes)  / sizeof(float);
+@@ -10531,6 +10560,9 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
+     // unused bindings get a dummy
+     vk_subbuffer ids_buf   = src_ids ? ggml_vk_tensor_subbuffer(ctx, src_ids) : dst_buf;
+     vk_subbuffer cache_buf = dst_buf;
++    const bool   prologue  = ggml_get_op_params_i32(dst, 1) != 0;
++    vk_subbuffer a_buf     = prologue ? ggml_vk_tensor_subbuffer(ctx, dst->src[7]) : dst_buf;
++    vk_subbuffer dtb_buf   = prologue ? ggml_vk_tensor_subbuffer(ctx, dst->src[8]) : dst_buf;
+ 
+     uint32_t cache_out = 0, cache_seq_stride = 0, cache_slot_stride = 0;
+     if (ctx->num_additional_fused_ops > 0) {
+@@ -10570,10 +10602,13 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
+         state_seq_stride,
+         src_ids ? 1u : 0u,
+         cache_out, cache_seq_stride, cache_slot_stride,
++        prologue ? 1u : 0u,
++        prologue ? ggml_get_op_params_f32(dst, 2) : 0.0f,
++        prologue ? ggml_get_op_params_f32(dst, 3) : 0.0f,
+     };
+ 
+     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, ids_buf, cache_buf},
++        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, ids_buf, cache_buf, a_buf, dtb_buf},
+         pc, { H, n_seqs, S_v });
+ }
+ 
+@@ -12940,6 +12975,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
+     case GGML_OP_DSV4_HC_PRE_MIX:
+         ggml_vk_dsv4_hc_pre_mix(ctx, compute_ctx, node);
+ 
++        break;
++    case GGML_OP_DSV4_HC_MIX_PARTIALS:
++        ggml_vk_dsv4_hc_mix_partials(ctx, compute_ctx, node);
++
+         break;
+     case GGML_OP_MEAN:
+         ggml_vk_mean(ctx, compute_ctx, src0, node);
+@@ -16344,6 +16383,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 }
+                 return true;
+             }
++        case GGML_OP_DSV4_HC_MIX_PARTIALS:
++            {
++                // misalignment of a quantized src must be whole blocks, see the push constants
++                return device->pipeline_dsv4_hc_mix_partials_q8_0 != nullptr && op->src[0]->type == GGML_TYPE_Q8_0 &&
++                       op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[1] <= 31 &&
++                       op->src[0]->ne[0] % 512 == 0 && op->src[0]->ne[0] / 512 == ggml_get_op_params_i32(op, 0) &&
++                       op->src[1]->ne[2] <= 65535 * 8;
++            }
+         case GGML_OP_DSV4_HC_PRE_MIX:
+             {
+                 for (uint32_t i = 0; i < 5; ++i) {
+@@ -16459,6 +16506,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 if (op->src[6] && op->src[6]->type != GGML_TYPE_I32) {
+                     return false;
+                 }
++                if (ggml_get_op_params_i32(op, 1) != 0) {
++                    // KDA prologue: per-head A, per-channel dt_b, q and k read with the same strides
++                    if (!op->src[7] || !op->src[8] || op->src[7]->type != GGML_TYPE_F32 || op->src[8]->type != GGML_TYPE_F32 ||
++                        op->src[3]->ne[0] != S_v || op->src[0]->nb[1] != op->src[1]->nb[1] ||
++                        op->src[0]->nb[2] != op->src[1]->nb[2] || op->src[0]->nb[3] != op->src[1]->nb[3]) {
++                        return false;
++                    }
++                }
+                 return op->type == GGML_TYPE_F32;
+             }
+         case GGML_OP_SSM_SCAN:
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_mix_partials.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_mix_partials.comp
+new file mode 100644
+index 000000000..f55919f31
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_mix_partials.comp
+@@ -0,0 +1,112 @@
++#version 450
++
++#extension GL_EXT_control_flow_attributes : require
++#extension GL_EXT_shader_16bit_storage : require
++
++#include "types.glsl"
++
++// Split-K hc_fn matvec for few tokens (q8_0 weights, m <= 31 rows). Workgroup (p, g) multiplies the K slice p of
++// SLICE_BLOCKS*32 elements with tokens g*NT .. g*NT+NT-1 and writes
++//   dst[i, t, p] = sum over the slice of hc_fn[:, i] * x[:, t]    for i < m
++//   dst[m, t, p] = sum over the slice of x[:, t]^2
++//   dst[i, t, p] = 0                                              for m < i < 32
++// ggml_dsv4_hc_pre_mix sums the slices. Per block: sum(q*x) * d, then the blocks of the slice in order.
++
++layout(constant_id = 0) const uint BLOCK_SIZE = 256;
++layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
++
++const uint QK          = 32;
++const uint SLICE_BLOCKS = 16;
++const uint SLICE       = SLICE_BLOCKS * QK;
++const uint NT          = 8;
++const uint MAX_M       = 31;
++const uint TAIL        = 32;
++
++layout(push_constant) uniform parameter
++{
++    uint m;
++    uint k;           // elements per row of hc_fn = elements per token of x
++    uint n_tokens;
++    uint n_split;     // k / SLICE
++    uint a_offset;    // blocks
++    uint x_offset;    // floats
++    uint d_offset;    // floats
++};
++
++layout(binding = 0, std430) readonly buffer A { block_q8_0 data_a[]; };
++layout(binding = 1, std430) readonly buffer X { float data_x[]; };
++layout(binding = 2, std430) writeonly buffer D { float data_d[]; };
++
++shared float xs[NT * SLICE];
++shared float part[MAX_M * SLICE_BLOCKS * NT];
++shared float sq[NT * 32];
++
++void main() {
++    const uint tid = gl_LocalInvocationID.x;
++    const uint p   = gl_WorkGroupID.x;
++    const uint t0  = gl_WorkGroupID.y * NT;
++    const uint nt  = min(NT, n_tokens - t0);
++    const uint k0  = p * SLICE;
++
++    for (uint idx = tid; idx < NT * SLICE; idx += BLOCK_SIZE) {
++        const uint t = idx / SLICE;
++        const uint j = idx % SLICE;
++        xs[idx] = t < nt ? data_x[x_offset + (t0 + t) * k + k0 + j] : 0.0f;
++    }
++    barrier();
++
++    // partial sums of squares: 32 invocations per token
++    for (uint idx = tid; idx < NT * 32; idx += BLOCK_SIZE) {
++        const uint t = idx / 32;
++        const uint l = idx % 32;
++        float s = 0.0f;
++        for (uint j = l; j < SLICE; j += 32) {
++            const float v = xs[t * SLICE + j];
++            s = fma(v, v, s);
++        }
++        sq[idx] = s;
++    }
++
++    // one (row, block) unit per invocation and round
++    const uint nb_row = k / QK;
++    for (uint u = tid; u < m * SLICE_BLOCKS; u += BLOCK_SIZE) {
++        const uint row = u / SLICE_BLOCKS;
++        const uint b   = u % SLICE_BLOCKS;
++        const uint ib  = a_offset + row * nb_row + p * SLICE_BLOCKS + b;
++        const float d  = float(data_a[ib].d);
++
++        float acc[NT];
++        [[unroll]] for (uint t = 0; t < NT; ++t) {
++            acc[t] = 0.0f;
++        }
++        [[unroll]] for (uint j = 0; j < QK; ++j) {
++            const float q = float(data_a[ib].qs[j]);
++            [[unroll]] for (uint t = 0; t < NT; ++t) {
++                acc[t] = fma(q, xs[t * SLICE + b * QK + j], acc[t]);
++            }
++        }
++        [[unroll]] for (uint t = 0; t < NT; ++t) {
++            part[(row * SLICE_BLOCKS + b) * NT + t] = acc[t] * d;
++        }
++    }
++    barrier();
++
++    for (uint w = tid; w < TAIL * NT; w += BLOCK_SIZE) {
++        const uint i = w / NT;
++        const uint t = w % NT;
++        if (t >= nt) {
++            continue;
++        }
++        float s = 0.0f;
++        if (i < m) {
++            [[unroll]] for (uint b = 0; b < SLICE_BLOCKS; ++b) {
++                s += part[(i * SLICE_BLOCKS + b) * NT + t];
++            }
++        } else if (i == m) {
++            for (uint l = 0; l < 32; ++l) {
++                s += sq[t * 32 + l];
++            }
++        }
++        data_d[d_offset + (p * n_tokens + t0 + t) * TAIL + i] = s;
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_pre_mix.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_pre_mix.comp
+index 1a7e0de14..d19c056b8 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_pre_mix.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_pre_mix.comp
+@@ -43,6 +43,8 @@ layout(push_constant) uniform parameter
+     float hc_eps;
+     uint  n_iter;
+     uint  fold_rms;
++    uint  n_split;   // > 0: mixes are ggml_dsv4_hc_mix_partials [32, n_tokens, n_split], summed here
++    uint  nbm2;
+ };
+ 
+ layout(binding = 0, std430) readonly buffer X { float data_x[]; };
+@@ -61,6 +63,29 @@ const uint N_SUBGROUPS = BLOCK_SIZE / SUBGROUP_SIZE;
+ 
+ shared float red[N_SUBGROUPS];
+ shared float pre_s[hc];
++shared float msum[TAIL];
++
++// reads mix i of token it (raw, before * r)
++float mix_raw(const uint it, const uint i) {
++    return n_split != 0 ? msum[i] : data_m[m_offset + i * nbm0 + it * nbm1];
++}
++
++// split-K partials: sum the slices in order; row 2*hc+hc*hc holds the slice's sum of squares of x.
++// Every invocation reaches the barrier.
++void sum_partials(const uint it) {
++    if (n_split == 0) {
++        return;
++    }
++    const uint tid = gl_LocalInvocationID.x;
++    if (tid <= (2 + hc) * hc) {
++        float acc = 0.0f;
++        for (uint p = 0; p < n_split; ++p) {
++            acc += data_m[m_offset + tid * nbm0 + it * nbm1 + p * nbm2];
++        }
++        msum[tid] = acc;
++    }
++    barrier();
++}
+ 
+ float wg_sum(float v) {
+     v = subgroupAdd(v);
+@@ -86,7 +111,7 @@ void weights(const uint it, const uint tb, const float r, const bool write_pre)
+         const uint lane = gl_SubgroupInvocationID;
+         const uint idx  = lane & 15;    // idst + hc*isrc
+ 
+-        float v = (data_m[m_offset + (2*hc + idx) * nbm0 + it * nbm1] * r) * data_s[s_offset + 2 * nbs0]
++        float v = (mix_raw(it, 2*hc + idx) * r) * data_s[s_offset + 2 * nbs0]
+                 + data_b[b_offset + (2*hc + idx) * nbb0];
+ 
+         float vmax = max(v, subgroupShuffleXor(v, 1));
+@@ -117,11 +142,11 @@ void weights(const uint it, const uint tb, const float r, const bool write_pre)
+ 
+         if (lane < hc) {
+             if (write_pre) {
+-                const float u = (data_m[m_offset + lane * nbm0 + it * nbm1] * r) * data_s[s_offset] + data_b[b_offset + lane * nbb0];
++                const float u = (mix_raw(it, lane) * r) * data_s[s_offset] + data_b[b_offset + lane * nbb0];
+                 pre_s[lane] = sigmoid(u) + hc_eps;
+             }
+         } else if (lane < 2*hc) {
+-            const float u = (data_m[m_offset + lane * nbm0 + it * nbm1] * r) * data_s[s_offset + nbs0] + data_b[b_offset + lane * nbb0];
++            const float u = (mix_raw(it, lane) * r) * data_s[s_offset + nbs0] + data_b[b_offset + lane * nbb0];
+             data_d[tb + lane - hc] = 2.0f * sigmoid(u);
+         }
+     } else if (gl_SubgroupID == 1) {
+@@ -153,16 +178,22 @@ void main_vec4() {
+         }
+     }
+ 
++    sum_partials(it);
++
+     float r = 1.0f;
+     if (fold_rms != 0) {
+-        ss = wg_sum(ss);
+-        r = inversesqrt(ss / float(hc * n_embd) + rms_eps);
++        if (n_split != 0) {
++            r = inversesqrt(msum[(2 + hc) * hc] / float(hc * n_embd) + rms_eps);
++        } else {
++            ss = wg_sum(ss);
++            r = inversesqrt(ss / float(hc * n_embd) + rms_eps);
++        }
+     }
+ 
+     // every invocation derives pre itself, so the sinkhorn in subgroup 0 overlaps with pass 2
+     float p[hc];
+     [[unroll]] for (uint h = 0; h < hc; ++h) {
+-        const float u = (data_m[m_offset + h * nbm0 + it * nbm1] * r) * data_s[s_offset] + data_b[b_offset + h * nbb0];
++        const float u = (mix_raw(it, h) * r) * data_s[s_offset] + data_b[b_offset + h * nbb0];
+         p[h] = sigmoid(u) + hc_eps;
+     }
+ 
+@@ -199,8 +230,12 @@ void main_scalar() {
+     const uint tb = d_offset + n_tokens * n_embd + it * TAIL;
+ 
+     // pass 1: flat rms factor
++    sum_partials(it);
++
+     float r = 1.0f;
+-    if (fold_rms != 0) {
++    if (fold_rms != 0 && n_split != 0) {
++        r = inversesqrt(msum[(2 + hc) * hc] / float(hc * n_embd) + rms_eps);
++    } else if (fold_rms != 0) {
+         float ss = 0.0f;
+         [[unroll]] for (uint h = 0; h < hc; ++h) {
+             for (uint i = tid; i < n_embd; i += BLOCK_SIZE) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+index adddaa4fd..1612b7219 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+@@ -37,6 +37,9 @@ layout(push_constant) uniform Parameters {
+     uint cache_out;         // write the snapshots straight into the recurrent cache (fused GDN -> CPY)
+     uint cache_seq_stride;  // floats between the cache rows of two seqs
+     uint cache_slot_stride; // floats between two snapshot slots in the cache
++    uint prologue;          // KDA prologue: raw q/k (l2-normalized here), raw gate (+dt_b, *A, lb*sigmoid(-x)), raw beta
++    float pro_lb;
++    float pro_l2_eps;
+ };
+ 
+ layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
+@@ -48,6 +51,8 @@ layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
+ layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
+ layout(binding = 7) readonly  buffer IdsBuf   { int        data_ids[];   };
+ layout(binding = 8)           buffer CacheBuf { FLOAT_TYPE data_cache[]; };
++layout(binding = 9)  readonly  buffer ABuf     { FLOAT_TYPE data_a[];     };
++layout(binding = 10) readonly  buffer DtbBuf   { FLOAT_TYPE data_dtb[];   };
+ 
+ #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
+ shared FLOAT_TYPE temp[SUBGROUP_SIZE];
+@@ -133,7 +138,7 @@ void main() {
+         const uint k_off = q_off;
+         const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
+         const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
+-        const FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
++        FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
+ 
+         FLOAT_TYPE k_reg[ROWS_PER_LANE];
+         FLOAT_TYPE q_reg[ROWS_PER_LANE];
+@@ -143,8 +148,39 @@ void main() {
+             q_reg[r] = FLOAT_TYPE(data_q[q_off + i]);
+         }
+ 
++        if (KDA != 0 && prologue != 0u) {
++            // l2 norm over S_V, the same ops as build_gdn_l2_norm (rms_norm(x, eps/n) * 1/sqrt(n)); the lanes
++            // of a column hold the whole vector
++            FLOAT_TYPE qq = 0.0, kk = 0.0;
++            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
++                qq += q_reg[r] * q_reg[r];
++                kk += k_reg[r] * k_reg[r];
++            }
++            qq = reduce_partial(qq);
++            kk = reduce_partial(kk);
++            const FLOAT_TYPE n   = FLOAT_TYPE(S_V);
++            const FLOAT_TYPE eps = FLOAT_TYPE(pro_l2_eps) / n;
++            const FLOAT_TYPE fq  = inversesqrt(qq / n + eps);
++            const FLOAT_TYPE fk  = inversesqrt(kk / n + eps);
++            const FLOAT_TYPE inv_sqrt_n = FLOAT_TYPE(1.0) / sqrt(n);
++            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
++                q_reg[r] = fq * q_reg[r] * inv_sqrt_n;
++                k_reg[r] = fk * k_reg[r] * inv_sqrt_n;
++            }
++            beta_val = FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + exp(-beta_val));
++        }
++
+         FLOAT_TYPE g_exp[ROWS_PER_LANE];
+-        if (KDA == 0) {
++        if (KDA != 0 && prologue != 0u) {
++            const uint g_base = gb_off * S_V;
++            const FLOAT_TYPE a_h = FLOAT_TYPE(data_a[head_id]);
++            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
++                const uint i = r * LANES_PER_COLUMN + lane;
++                const FLOAT_TYPE u = (FLOAT_TYPE(data_g[g_base + i]) + FLOAT_TYPE(data_dtb[head_id * S_V + i])) * a_h;
++                const FLOAT_TYPE gv = (FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + exp(-(u * FLOAT_TYPE(-1.0))))) * FLOAT_TYPE(pro_lb);
++                g_exp[r] = exp(gv);
++            }
++        } else if (KDA == 0) {
+             const FLOAT_TYPE g_val = exp(FLOAT_TYPE(data_g[gb_off]));
+             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                 g_exp[r] = g_val;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index f0661a76e..917cb38ac 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -1113,6 +1113,7 @@ void process_shaders() {
+     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
+     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
+     string_to_spv("dsv4_hc_pre_mix_f32", "dsv4_hc_pre_mix.comp", {});
++    string_to_spv("dsv4_hc_mix_partials_q8_0", "dsv4_hc_mix_partials.comp", {{"DATA_A_Q8_0", "1"}});
+     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("cumsum_multipass2_f32", "cumsum_multipass2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 7a1a0d9b5..bf18f306a 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1085,6 +1085,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "DSV4_HC_PRE",
+     "DSV4_HC_POST",
+     "DSV4_HC_PRE_MIX",
++    "DSV4_HC_MIX_PARTIALS",
+ 
+     "UNARY",
+ 
+@@ -1102,7 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1201,6 +1202,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "dsv4_hc_pre(x, weights)",
+     "dsv4_hc_post(x, residual, post, comb)",
+     "dsv4_hc_pre_mix(x, mixes, scale, base, norm_w)",
++    "dsv4_hc_mix_partials(hc_fn, x)",
+ 
+     "unary(x)",
+ 
+@@ -1218,7 +1220,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6477,6 +6479,39 @@ struct ggml_tensor * ggml_gated_delta_net_ids(
+     return result;
+ }
+ 
++// ggml_gated_delta_net_set_kda_prologue
++
++struct ggml_tensor * ggml_gated_delta_net_set_kda_prologue(
++        struct ggml_tensor  * gdn,
++        struct ggml_tensor  * A,
++        struct ggml_tensor  * dt_b,
++        float                 lb,
++        float                 l2_eps) {
++    GGML_ASSERT(gdn->op == GGML_OP_GATED_DELTA_NET);
++    GGML_ASSERT(gdn->src[6] != NULL && "the KDA prologue needs ggml_gated_delta_net_ids (src[6])");
++
++    const struct ggml_tensor * q = gdn->src[0];
++    const struct ggml_tensor * v = gdn->src[2];
++    const struct ggml_tensor * g = gdn->src[3];
++
++    const int64_t S_v = v->ne[0];
++    const int64_t H   = v->ne[1];
++
++    GGML_ASSERT(g->ne[0] == S_v);
++    GGML_ASSERT(q->ne[0] == S_v && q->ne[1] == H && gdn->src[1]->ne[1] == H);
++    GGML_ASSERT(A->type == GGML_TYPE_F32 && ggml_is_contiguous(A) && ggml_nelements(A) == H);
++    GGML_ASSERT(dt_b->type == GGML_TYPE_F32 && ggml_is_contiguous(dt_b) && ggml_nelements(dt_b) == S_v*H);
++
++    ggml_set_op_params_i32(gdn, 1, 1);
++    ggml_set_op_params_f32(gdn, 2, lb);
++    ggml_set_op_params_f32(gdn, 3, l2_eps);
++
++    gdn->src[7] = A;
++    gdn->src[8] = dt_b;
++
++    return gdn;
++}
++
+ // ggml_lightning_indexer
+ 
+ struct ggml_tensor * ggml_lightning_indexer(
+@@ -6648,9 +6683,12 @@ struct ggml_tensor * ggml_dsv4_hc_pre_mix(
+ 
+     GGML_ASSERT(hc == 4);
+     GGML_ASSERT(x->ne[3] == 1);
+-    GGML_ASSERT(mixes->ne[0] == (2 + hc)*hc);
++    // mixes: [(2 + hc)*hc, n_tokens], or the split-K partials of ggml_dsv4_hc_mix_partials [32, n_tokens, n_split]
++    const bool partials = mixes->op == GGML_OP_DSV4_HC_MIX_PARTIALS;
++    GGML_ASSERT(mixes->ne[0] == (partials ? GGML_DSV4_HC_PRE_MIX_TAIL : (2 + hc)*hc));
+     GGML_ASSERT(mixes->ne[1] == n_tokens);
+-    GGML_ASSERT(mixes->ne[2] == 1 && mixes->ne[3] == 1);
++    GGML_ASSERT((partials || mixes->ne[2] == 1) && mixes->ne[3] == 1);
++    GGML_ASSERT(!partials || ggml_is_contiguous(mixes));
+     GGML_ASSERT(scale->ne[0] >= 3);
+     GGML_ASSERT(ggml_nelements(base) == (2 + hc)*hc);
+     GGML_ASSERT(ggml_nelements(norm_w) == n_embd);
+@@ -6665,6 +6703,7 @@ struct ggml_tensor * ggml_dsv4_hc_pre_mix(
+     ggml_set_op_params_i32(result, 4, fold_rms ? 1 : 0);
+     ggml_set_op_params_i32(result, 5, (int32_t) n_embd);
+     ggml_set_op_params_i32(result, 6, (int32_t) n_tokens);
++    ggml_set_op_params_i32(result, 7, partials ? 1 : 0);
+ 
+     result->op     = GGML_OP_DSV4_HC_PRE_MIX;
+     result->src[0] = x;
+@@ -6699,6 +6738,36 @@ struct ggml_tensor * ggml_dsv4_hc_pre_mix_comb(struct ggml_context * ctx, struct
+             (n_embd*n_tokens + 4)*sizeof(float));
+ }
+ 
++// ggml_dsv4_hc_mix_partials
++
++struct ggml_tensor * ggml_dsv4_hc_mix_partials(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * hc_fn,
++        struct ggml_tensor  * x,
++        int32_t               n_split) {
++    GGML_ASSERT(hc_fn->type == GGML_TYPE_Q8_0);
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(hc_fn) && ggml_is_contiguous(x));
++
++    const int64_t K        = x->ne[0]*x->ne[1];
++    const int64_t n_tokens = x->ne[2];
++
++    GGML_ASSERT(x->ne[3] == 1);
++    GGML_ASSERT(hc_fn->ne[0] == K);
++    GGML_ASSERT(hc_fn->ne[1] < GGML_DSV4_HC_PRE_MIX_TAIL);
++    GGML_ASSERT(n_split > 0 && K % (32*n_split) == 0);
++
++    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, GGML_DSV4_HC_PRE_MIX_TAIL, n_tokens, n_split);
++
++    ggml_set_op_params_i32(result, 0, n_split);
++
++    result->op     = GGML_OP_DSV4_HC_MIX_PARTIALS;
++    result->src[0] = hc_fn;
++    result->src[1] = x;
++
++    return result;
++}
++
+ // ggml_dsv4_hc_post
+ 
+ struct ggml_tensor * ggml_dsv4_hc_post(
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 8a07a430e..2d577deea 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -323,6 +323,8 @@ llama_context::llama_context(
+     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+ 
++    // LLAMA_KDA_PROLOGUE=0 keeps the KDA q/k norms, decay gate and beta sigmoid as separate ops
++    cparams.fused_kda_prologue = !(getenv("LLAMA_KDA_PROLOGUE") && strcmp(getenv("LLAMA_KDA_PROLOGUE"), "0") == 0);
+     cparams.fused_gdn_ar = true;
+     cparams.fused_gdn_ch = true;
+     cparams.auto_fgdn    = false;
+@@ -340,6 +342,8 @@ llama_context::llama_context(
+         const char * env = getenv("LLAMA_HC_PRE_MIX");
+         cparams.fused_dsv4_hc_pre_mix      = !(env && strcmp(env, "0") == 0);
+         cparams.fused_dsv4_hc_pre_mix_fold = !(env && strcmp(env, "nofold") == 0);
++        // LLAMA_HC_MIX_SPLIT=0 keeps the plain hc_fn matvec
++        cparams.fused_hc_mix_split = !(getenv("LLAMA_HC_MIX_SPLIT") && strcmp(getenv("LLAMA_HC_MIX_SPLIT"), "0") == 0);
+     }
+ 
+     // with causal attention, the batch size is limited by the context size
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 68e0ace01..3bc6ea85c 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -39,6 +39,7 @@ struct llama_cparams {
+     bool offload_kqv;
+     bool flash_attn;
+     bool auto_fa;
++    bool fused_kda_prologue; // KDA q/k l2 norm, decay gate and beta sigmoid inside the gated delta net op (glm5-next)
+     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
+     bool fused_gdn_ch;       // use fused gated delta net (chunked)
+     bool auto_fgdn;
+@@ -48,7 +49,8 @@ struct llama_cparams {
+     bool fused_dsv4_hc_comb;
+     bool fused_dsv4_hc_post;
+     bool fused_dsv4_hc_pre_mix;      // whole mHC pre half in one op (glm5-next)
+-    bool fused_dsv4_hc_pre_mix_fold; // fold the flat rms norm into the pre_mix op
++    bool fused_dsv4_hc_pre_mix_fold;
++    bool fused_hc_mix_split;         // split-K hc_fn matvec for <= 8 tokens, reduced in the pre_mix op // fold the flat rms norm into the pre_mix op
+     bool auto_fhc;
+     bool no_perf;
+     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index e4ba3629e..097ccf1b8 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -534,7 +534,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+         ggml_tensor *        b,
+         ggml_tensor *        s,
+         int                  il,
+-        ggml_tensor *        s_ids) {
++        ggml_tensor *        s_ids,
++        const llm_kda_prologue * pro) {
+     const auto * mctx_cur   = inp->mctx;
+     const auto   kv_head    = mctx_cur->get_head();
+     const uint32_t mem_size = mctx_cur->get_size();
+@@ -546,7 +547,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+ 
+     const bool keep = cparams.n_rs_seq > 0;
+ 
+-    GGML_ASSERT(keep || s_ids == nullptr);
++    GGML_ASSERT(keep || (s_ids == nullptr && pro == nullptr));
+ 
+     if (!keep) {
+         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
+@@ -569,6 +570,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
+     ggml_tensor * gdn_out = s_ids ? ggml_gated_delta_net_ids(ctx0, q, k, v, g, b, s, s_ids, K)
+                                   : ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
++    if (pro) {
++        GGML_ASSERT(s_ids != nullptr);
++        ggml_gated_delta_net_set_kda_prologue(gdn_out, pro->A, pro->dt_b, pro->lb, pro->l2_eps);
++    }
+     if (n_seq_tokens > 1) {
+         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+     } else {
+diff --git a/src/models/glm5-next.cpp b/src/models/glm5-next.cpp
+index 5002eb182..abb637938 100644
+--- a/src/models/glm5-next.cpp
++++ b/src/models/glm5-next.cpp
+@@ -525,7 +525,19 @@ ggml_tensor * llama_model_glm5_next::graph::build_hc_pre(
+     if (cparams.fused_dsv4_hc_pre_mix && il >= 0) {
+         // hc_fn*rms_norm(x) == r*(hc_fn*x) for the unweighted flat norm, so the op can apply r itself
+         const bool fold = cparams.fused_dsv4_hc_pre_mix_fold;
+-        ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, fold ? flat : ggml_rms_norm(ctx0, flat, norm_rms_eps));
++        ggml_tensor * mixes = nullptr;
++        if (fold && cparams.fused_hc_mix_split && nt <= 8 && hc_fn->type == GGML_TYPE_Q8_0 && hc_dim % 512 == 0) {
++            // few tokens: split-K matvec into 512-element slices (24 rows alone leave most of the GPU idle);
++            // the pre_mix op sums the slices and takes r from their sums of squares
++            ggml_tensor * part = ggml_dsv4_hc_mix_partials(ctx0, hc_fn, x, (int32_t) (hc_dim / 512));
++            ggml_backend_dev_t dev = model.dev_layer(il);
++            if (dev != nullptr && ggml_backend_dev_supports_op(dev, part)) {
++                mixes = part;
++            }
++        }
++        if (mixes == nullptr) {
++            mixes = ggml_mul_mat(ctx0, hc_fn, fold ? flat : ggml_rms_norm(ctx0, flat, norm_rms_eps));
++        }
+         cb(mixes, "hc_mixes", il);
+ 
+         ggml_tensor * mix = ggml_dsv4_hc_pre_mix(ctx0, x, mixes, hc_scale, hc_base, norm_w,
+@@ -935,48 +947,72 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
+     cb(Kcur, "kda_k_conv", il);
+     cb(Vcur, "kda_v_conv", il);
+ 
++    const int64_t n_embd_s = hparams.n_embd_s();
++    ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
++
++    // Read the SSM state straight from its cache row (ids = s_copy) instead of gathering a copy of it first
++    // (4 MiB per layer). Only when nothing else moves rows of this layer's cache in this graph: a single
++    // sequence and cell, no state to clear, and the rollback snapshots kept (the op writes them, see
++    // build_recurrent_attn). The op reads every state shard before it overwrites it, so the snapshot slots may
++    // alias the row it reads.
++    bool state_ids = cparams.n_rs_seq > 0 && n_seqs == 1 && mctx_cur->get_n_rs() == 1 && mctx_cur->get_rs_z() < 0 &&
++                     ssm_states_all->type == GGML_TYPE_F32;
++
+     // Decay gate, ssm_a holds -exp(A_log)
+     ggml_tensor * f_a = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
+-    ggml_tensor * g1  = ggml_mul_mat(ctx0, layer.ssm_f_b, f_a);
+-    g1 = ggml_add(ctx0, g1, layer.ssm_dt_b);
++    ggml_tensor * g_raw = ggml_mul_mat(ctx0, layer.ssm_f_b, f_a);
++    ggml_tensor * beta_raw = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
++    beta_raw = ggml_reshape_4d(ctx0, beta_raw, 1, n_head_kda, n_seq_tokens, n_seqs);
++
++    // Match FLA l2 norm
++    constexpr float l2_eps = 1e-6f;
+ 
+-    ggml_tensor * A = ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head_kda, 1);
++    // small ubatches: the q/k l2 norms, the decay gate and the beta sigmoid run inside the gated delta net op
++    const llm_kda_prologue pro = { layer.ssm_a, layer.ssm_dt_b, hparams.kda_gate_lower_bound, l2_eps };
++    bool use_pro = state_ids && cparams.fused_kda_prologue && n_seq_tokens <= 8 && hparams.kda_gate_lower_bound > -INFINITY;
+ 
+-    if (hparams.kda_gate_lower_bound > -INFINITY) {
+-        g1 = ggml_reshape_3d(ctx0, g1, head_dim, n_head_kda, n_tokens);
+-        g1 = ggml_mul(ctx0, g1, A);
+-        g1 = ggml_sigmoid(ctx0, ggml_scale(ctx0, g1, -1.0f));
+-        g1 = ggml_scale(ctx0, g1, hparams.kda_gate_lower_bound);
+-    } else {
+-        g1 = ggml_softplus(ctx0, g1);
+-        g1 = ggml_reshape_3d(ctx0, g1, head_dim, n_head_kda, n_tokens);
+-        g1 = ggml_mul(ctx0, g1, A);
++    ggml_tensor * g1;
++    ggml_tensor * beta;
++    if (use_pro) {
++        g1   = ggml_reshape_4d(ctx0, g_raw, head_dim, n_head_kda, n_seq_tokens, n_seqs);
++        beta = beta_raw;
++
++        // backends without the prologue (or ids) would compute garbage, so ask the layer's device
++        ggml_tensor * states_2d = ggml_reshape_2d(ctx0, ssm_states_all, n_embd_s, ssm_states_all->ne[1]);
++        ggml_tensor * probe = ggml_gated_delta_net_ids(ctx0, Qcur, Kcur, Vcur, g1, beta, states_2d, inp_rs->s_copy_main,
++                                                       cparams.n_rs_seq + 1);
++        ggml_gated_delta_net_set_kda_prologue(probe, pro.A, pro.dt_b, pro.lb, pro.l2_eps);
++        ggml_backend_dev_t dev = model.dev_layer(il);
++        use_pro = dev != nullptr && ggml_backend_dev_supports_op(dev, probe);
+     }
+-    cb(g1, "kda_g1", il);
+ 
+-    g1 = ggml_reshape_4d(ctx0, g1, head_dim, n_head_kda, n_seq_tokens, n_seqs);
++    if (!use_pro) {
++        g1 = ggml_add(ctx0, g_raw, layer.ssm_dt_b);
+ 
+-    ggml_tensor * beta = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
+-    beta = ggml_reshape_4d(ctx0, beta, 1, n_head_kda, n_seq_tokens, n_seqs);
+-    beta = ggml_sigmoid(ctx0, beta);
+-    cb(beta, "kda_beta", il);
++        ggml_tensor * A = ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head_kda, 1);
+ 
+-    // Match FLA l2 norm
+-    constexpr float l2_eps = 1e-6f;
+-    Qcur = build_gdn_l2_norm(ctx0, Qcur, l2_eps);
+-    Kcur = build_gdn_l2_norm(ctx0, Kcur, l2_eps);
++        if (hparams.kda_gate_lower_bound > -INFINITY) {
++            g1 = ggml_reshape_3d(ctx0, g1, head_dim, n_head_kda, n_tokens);
++            g1 = ggml_mul(ctx0, g1, A);
++            g1 = ggml_sigmoid(ctx0, ggml_scale(ctx0, g1, -1.0f));
++            g1 = ggml_scale(ctx0, g1, hparams.kda_gate_lower_bound);
++        } else {
++            g1 = ggml_softplus(ctx0, g1);
++            g1 = ggml_reshape_3d(ctx0, g1, head_dim, n_head_kda, n_tokens);
++            g1 = ggml_mul(ctx0, g1, A);
++        }
++        cb(g1, "kda_g1", il);
+ 
+-    ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
++        g1 = ggml_reshape_4d(ctx0, g1, head_dim, n_head_kda, n_seq_tokens, n_seqs);
+ 
+-    // Read the SSM state straight from its cache row (ids = s_copy) instead of gathering a copy of it first
+-    // (4 MiB per layer). Only when nothing else moves rows of this layer's cache in this graph: a single
+-    // sequence and cell, no state to clear, and the rollback snapshots kept (the op writes them, see
+-    // build_recurrent_attn). The op reads every state shard before it overwrites it, so the snapshot slots may
+-    // alias the row it reads.
+-    const int64_t n_embd_s = hparams.n_embd_s();
+-    bool state_ids = cparams.n_rs_seq > 0 && n_seqs == 1 && mctx_cur->get_n_rs() == 1 && mctx_cur->get_rs_z() < 0 &&
+-                     ssm_states_all->type == GGML_TYPE_F32;
+-    if (state_ids) {
++        beta = ggml_sigmoid(ctx0, beta_raw);
++        cb(beta, "kda_beta", il);
++
++        Qcur = build_gdn_l2_norm(ctx0, Qcur, l2_eps);
++        Kcur = build_gdn_l2_norm(ctx0, Kcur, l2_eps);
++    }
++
++    if (state_ids && !use_pro) {
+         // backends without ids support would compute garbage, so ask the layer's device
+         ggml_tensor * states_2d = ggml_reshape_2d(ctx0, ssm_states_all, n_embd_s, ssm_states_all->ne[1]);
+         ggml_tensor * probe = ggml_gated_delta_net_ids(ctx0, Qcur, Kcur, Vcur, g1, beta, states_2d, inp_rs->s_copy_main,
+@@ -996,7 +1032,8 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
+                 return states;
+             });
+         GGML_ASSERT(states_2d != nullptr && ids != nullptr);
+-        output = build_recurrent_attn(inp_rs, ssm_states_all, Qcur, Kcur, Vcur, g1, beta, states_2d, il, ids);
++        output = build_recurrent_attn(inp_rs, ssm_states_all, Qcur, Kcur, Vcur, g1, beta, states_2d, il, ids,
++                                      use_pro ? &pro : nullptr);
+     } else {
+         ggml_tensor * state = build_rs(inp_rs, ssm_states_all, n_embd_s, n_seqs);
+         state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head_kda, n_seqs);
+diff --git a/src/models/models.h b/src/models/models.h
+index 62b9991f1..bd8a7fb00 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -21,6 +21,14 @@ static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor *
+ // base classes
+ //
+ 
++// KDA prologue folded into the gated delta net op (raw q/k/g/beta), see ggml_gated_delta_net_set_kda_prologue
++struct llm_kda_prologue {
++    ggml_tensor * A;     // [H]
++    ggml_tensor * dt_b;  // [S_v*H]
++    float         lb;
++    float         l2_eps;
++};
++
+ struct llm_build_mamba_base : public llm_graph_context {
+     llm_build_mamba_base(const llm_graph_params & params);
+ 
+@@ -98,7 +106,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
+             ggml_tensor *        b,
+             ggml_tensor *        s,
+             int                  il,
+-            ggml_tensor *        s_ids = nullptr); // s = states [S_v*S_v*H_v, n_rows] read through s_ids, see ggml_gated_delta_net_ids
++            ggml_tensor *        s_ids = nullptr,  // s = states [S_v*S_v*H_v, n_rows] read through s_ids, see ggml_gated_delta_net_ids
++            const struct llm_kda_prologue * pro = nullptr); // needs s_ids, see ggml_gated_delta_net_set_kda_prologue
+ };
+ 
+ struct llm_build_rwkv6_base : public llm_graph_context {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 3f2d40712..7dd49b270 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4512,6 +4512,7 @@ struct test_dsv4_hc_pre_mix : public test_dsv4_hc {
+     const bool    fold;
+     const float   x_scale;   // != 1: scale x in-graph to test large/small norms
+     const ggml_type mm_type; // GGML_TYPE_COUNT: mixes is an input, else mixes = hc_fn(mm_type) * x as in glm5-next
++    const bool    split;     // mixes = ggml_dsv4_hc_mix_partials(hc_fn q8_0, x) (split-K, summed by the op)
+ 
+     std::string op_desc(ggml_tensor * t) override {
+         GGML_UNUSED(t);
+@@ -4519,7 +4520,7 @@ struct test_dsv4_hc_pre_mix : public test_dsv4_hc {
+     }
+ 
+     std::string vars() override {
+-        return VARS_TO_STR6(n_embd, n_tokens, n_iter, fold, x_scale, mm_type);
++        return VARS_TO_STR7(n_embd, n_tokens, n_iter, fold, x_scale, mm_type, split);
+     }
+ 
+     bool run_whole_graph() override { return mm_type != GGML_TYPE_COUNT || x_scale != 1.0f; }
+@@ -4527,8 +4528,8 @@ struct test_dsv4_hc_pre_mix : public test_dsv4_hc {
+     double max_nmse_err() override { return mm_type == GGML_TYPE_COUNT ? 1e-6 : 5e-4; }
+ 
+     test_dsv4_hc_pre_mix(int64_t n_embd = 64, int64_t n_tokens = 3, int32_t n_iter = 20, bool fold = true,
+-            float x_scale = 1.0f, ggml_type mm_type = GGML_TYPE_COUNT)
+-        : n_embd(n_embd), n_tokens(n_tokens), n_iter(n_iter), fold(fold), x_scale(x_scale), mm_type(mm_type) {}
++            float x_scale = 1.0f, ggml_type mm_type = GGML_TYPE_COUNT, bool split = false)
++        : n_embd(n_embd), n_tokens(n_tokens), n_iter(n_iter), fold(fold), x_scale(x_scale), mm_type(mm_type), split(split) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+@@ -4544,11 +4545,15 @@ struct test_dsv4_hc_pre_mix : public test_dsv4_hc {
+         } else {
+             ggml_tensor * hc_fn = ggml_new_tensor_2d(ctx, mm_type, hc*n_embd, (2 + hc)*hc);
+             ggml_set_name(hc_fn, "hc_fn");
+-            ggml_tensor * flat = ggml_reshape_2d(ctx, x, hc*n_embd, n_tokens);
+-            if (!fold) {
+-                flat = ggml_rms_norm(ctx, flat, 1e-6f);
++            if (split) {
++                mixes = ggml_dsv4_hc_mix_partials(ctx, hc_fn, x, (int32_t) (hc*n_embd/512));
++            } else {
++                ggml_tensor * flat = ggml_reshape_2d(ctx, x, hc*n_embd, n_tokens);
++                if (!fold) {
++                    flat = ggml_rms_norm(ctx, flat, 1e-6f);
++                }
++                mixes = ggml_mul_mat(ctx, hc_fn, flat);
+             }
+-            mixes = ggml_mul_mat(ctx, hc_fn, flat);
+         }
+ 
+         ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+@@ -4566,6 +4571,35 @@ struct test_dsv4_hc_pre_mix : public test_dsv4_hc {
+     }
+ };
+ 
++struct test_dsv4_hc_mix_partials : public test_dsv4_hc {
++    const int64_t n_embd;
++    const int64_t n_tokens;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "DSV4_HC_MIX_PARTIALS";
++    }
++
++    std::string vars() override {
++        return VARS_TO_STR2(n_embd, n_tokens);
++    }
++
++    double max_nmse_err() override { return 1e-5; }
++
++    test_dsv4_hc_mix_partials(int64_t n_embd = 4096, int64_t n_tokens = 3) : n_embd(n_embd), n_tokens(n_tokens) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
++        ggml_set_name(x, "x");
++        ggml_tensor * hc_fn = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc*n_embd, (2 + hc)*hc);
++        ggml_set_name(hc_fn, "hc_fn");
++        out = ggml_dsv4_hc_mix_partials(ctx, hc_fn, x, (int32_t) (hc*n_embd/512));
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
++
+ // GGML_OP_SSM_CONV
+ struct test_ssm_conv : public test_case {
+     const ggml_type type;
+@@ -5154,15 +5188,17 @@ struct test_gated_delta_net_ids_cache : public test_case {
+     const int64_t mem_size; // cells per plane
+     const int64_t kv_head;  // first cell written
+     const int64_t rollback; // plane the initial states are read from
++    const bool    prologue; // KDA prologue in the op: raw q/k/g/beta (ggml_gated_delta_net_set_kda_prologue)
+ 
+     std::string vars() override {
+-        return VARS_TO_STR8(head_count, head_size, n_seq_tokens, n_seqs, K, mem_size, kv_head, rollback);
++        return VARS_TO_STR9(head_count, head_size, n_seq_tokens, n_seqs, K, mem_size, kv_head, rollback, prologue);
+     }
+ 
+     test_gated_delta_net_ids_cache(int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 3,
+-            int64_t n_seqs = 1, int64_t K = 3, int64_t mem_size = 2, int64_t kv_head = 1, int64_t rollback = 0)
++            int64_t n_seqs = 1, int64_t K = 3, int64_t mem_size = 2, int64_t kv_head = 1, int64_t rollback = 0,
++            bool prologue = false)
+         : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K),
+-          mem_size(mem_size), kv_head(kv_head), rollback(rollback) {}
++          mem_size(mem_size), kv_head(kv_head), rollback(rollback), prologue(prologue) {}
+ 
+     std::string op_desc(ggml_tensor * t) override {
+         GGML_UNUSED(t);
+@@ -5194,10 +5230,19 @@ struct test_gated_delta_net_ids_cache : public test_case {
+         ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+         ggml_set_name(ids, "ids");
+ 
+-        q = ggml_l2_norm(ctx, q, 1e-6f);
+-        k = ggml_l2_norm(ctx, k, 1e-6f);
+-
+-        ggml_tensor * gdn = ggml_gated_delta_net_ids(ctx, q, k, v, g, beta, states, ids, K);
++        ggml_tensor * gdn;
++        if (prologue) {
++            ggml_tensor * A    = ggml_new_tensor_1d(ctx, type, H);
++            ggml_tensor * dt_b = ggml_new_tensor_1d(ctx, type, S_v * H);
++            ggml_set_name(A, "A");
++            ggml_set_name(dt_b, "dt_b");
++            gdn = ggml_gated_delta_net_ids(ctx, q, k, v, g, beta, states, ids, K);
++            ggml_gated_delta_net_set_kda_prologue(gdn, A, dt_b, -5.0f, 1e-6f);
++        } else {
++            q = ggml_l2_norm(ctx, q, 1e-6f);
++            k = ggml_l2_norm(ctx, k, 1e-6f);
++            gdn = ggml_gated_delta_net_ids(ctx, q, k, v, g, beta, states, ids, K);
++        }
+ 
+         const size_t tail_off = ggml_row_size(type, S_v * H * n_seq_tokens * n_seqs);
+         ggml_tensor * src = ggml_view_3d(ctx, gdn, D, n_seqs, n_written,
+@@ -5216,9 +5261,16 @@ struct test_gated_delta_net_ids_cache : public test_case {
+         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+             if (ggml_is_view_op(t->op)) { continue; }
+             if (strcmp(t->name, "g") == 0) {
+-                init_tensor_uniform(t, -5.0f, -1e-4f);
++                // raw gate pre-activation with the prologue: |A*g| up to ~40 saturates the sigmoid
++                prologue ? init_tensor_uniform(t, -4.0f, 4.0f) : init_tensor_uniform(t, -5.0f, -1e-4f);
+             } else if (strcmp(t->name, "beta") == 0) {
+-                init_tensor_uniform(t, 0.0f, 1.0f);
++                prologue ? init_tensor_uniform(t, -4.0f, 4.0f) : init_tensor_uniform(t, 0.0f, 1.0f);
++            } else if (strcmp(t->name, "A") == 0) {
++                init_tensor_uniform(t, -10.0f, -0.5f);
++            } else if (strcmp(t->name, "dt_b") == 0) {
++                init_tensor_uniform(t, -1.0f, 1.0f);
++            } else if (prologue && (strcmp(t->name, "q") == 0 || strcmp(t->name, "k") == 0)) {
++                init_tensor_uniform(t, -3.0f, 3.0f); // raw conv outputs, l2-normalized in the op
+             } else if (strcmp(t->name, "ids") == 0) {
+                 std::vector<int32_t> data(n_seqs);
+                 for (int64_t s = 0; s < n_seqs; ++s) {
+@@ -10110,6 +10162,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_dsv4_hc_pre_mix(4096, n_tokens, 20, true,  1.0f, GGML_TYPE_Q8_0));
+         test_cases.emplace_back(new test_dsv4_hc_pre_mix(4096, n_tokens, 20, false, 1.0f, GGML_TYPE_Q8_0));
+     }
++    // split-K hc_fn (decode / verify shapes) and the partials op on its own
++    for (int64_t n_tokens : {1, 2, 3, 5, 8}) {
++        test_cases.emplace_back(new test_dsv4_hc_pre_mix(4096, n_tokens, 20, true, 1.0f, GGML_TYPE_Q8_0, true));
++    }
++    test_cases.emplace_back(new test_dsv4_hc_pre_mix(4096, 3, 20, true, 37.0f, GGML_TYPE_Q8_0, true));
++    test_cases.emplace_back(new test_dsv4_hc_pre_mix(128, 3, 20, true, 1.0f, GGML_TYPE_Q8_0, true));
++    for (int64_t n_tokens : {1, 3, 8, 9, 17}) {
++        test_cases.emplace_back(new test_dsv4_hc_mix_partials(4096, n_tokens));
++    }
++    test_cases.emplace_back(new test_dsv4_hc_mix_partials(128, 3));
+ 
+     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
+     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
+@@ -12367,6 +12429,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gated_delta_net_ids_cache(4, 32, 3, 2, 3, 4, 1, 1)); // 2 seqs: no in-place fusion
+     test_cases.emplace_back(new test_gated_delta_net_ids_cache(4, 32, 5, 1, 3, 2, 1, 0)); // n_tokens > K
+     test_cases.emplace_back(new test_gated_delta_net_ids_cache(4, 32, 1, 1, 1, 2, 1, 0)); // K == 1
++    // KDA prologue folded into the op (glm5-next decode/verify: H 64, S 128, K 3, n 1..8)
++    for (int64_t n_tok : {1, 2, 3, 5, 8}) {
++        test_cases.emplace_back(new test_gated_delta_net_ids_cache(64, 128, n_tok, 1, 3, 1, 0, 0, true));
++        test_cases.emplace_back(new test_gated_delta_net_ids_cache(4, 32, n_tok, 1, 3, 2, 1, 1, true));
++    }
++    test_cases.emplace_back(new test_gated_delta_net_ids_cache(4, 32, 3, 2, 3, 4, 1, 1, true)); // 2 seqs
++    test_cases.emplace_back(new test_gated_delta_net_ids_cache(4, 64, 3, 1, 1, 2, 1, 0, true)); // K == 1
+     for (int64_t n_tok : { 1, 2, 3, 8 }) {
+         test_cases.emplace_back(new test_glm5_conv_qkv(256, n_tok, 1));
+         test_cases.emplace_back(new test_glm5_conv_qkv(8192, n_tok, 1));
+-- 
+2.43.0
+

@@ -1,0 +1,285 @@
+From 2d3414aa61f181f3619d61a8e2734b446caf2226 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 09:39:01 +0000
+Subject: [PATCH 14/23] vulkan: decode lightning indexer for small batches
+ (GLM-5.3-Flash DSA)
+
+The tiled indexer shader stages 64 keys x 8 tokens per workgroup and walks the 32 heads
+with a barrier per head, so at 1-3 tokens most invocations idle and each workgroup runs a
+long serial loop: 0.43 ms per call at 32K context (8K pooled keys), 0.75 ms at 64K.
+
+lightning_indexer_vec.comp handles batches of up to 8 tokens (GGML_VK_LID_VEC_MAX_TOKENS,
+0 = off): one invocation per key holds the key row in registers and scores it against
+every head, q and the head weights are workgroup-uniform loads, one workgroup per 64 keys
+and token. Everything is fp32 (the tiled shader rounds q and k to f16).
+
+test-backend-ops perf, Radeon 8060S, 32 heads x 128, f32 keys (old -> new):
+  2K keys  n=1 119 -> 12.7 us, n=3 122 -> 14.8 us
+  8K keys  n=1 430 -> 17.9 us, n=3 432 -> 30.6 us
+  16K keys n=1 747 -> 24.0 us, n=3 754 -> 58.1 us
+
+test-backend-ops: decode-sized indexer cases (odd head counts, ragged key counts, two
+streams, f32/f16/bf16/q8_0/q4_0) and GLM-shaped eval and perf cases.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan-types.h      |   1 +
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          |  28 +++-
+ .../vulkan-shaders/lightning_indexer_vec.comp | 120 ++++++++++++++++++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |   1 +
+ tests/test-backend-ops.cpp                    |  28 ++++
+ 5 files changed, 171 insertions(+), 7 deletions(-)
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/lightning_indexer_vec.comp
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index c3a36221e..cfdeb1358 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -991,6 +991,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_rwkv_wkv7_f32;
+     vk_pipeline pipeline_gated_linear_attn_f32;
+     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
++    vk_pipeline pipeline_lightning_indexer_vec_f32[GGML_TYPE_COUNT];
+     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
+     vk_pipeline pipeline_gated_delta_net[4][2];
+     vk_pipeline pipeline_ssm_scan_f32_d128;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index bc0144950..bc2de5ca9 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -3672,6 +3672,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     for (ggml_type k_type : lightning_indexer_k_types) {
+         const std::string name = "lightning_indexer_" + std::string(ggml_type_name(k_type)) + "_k_f32";
+         ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f32[k_type], name.c_str(), lightning_indexer_f32_len, lightning_indexer_f32_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {1, 1, 1}, {(uint32_t)k_type, fa_block_bytes(k_type)}, 1, true);
++        const std::string vec_name = "lightning_indexer_vec_" + std::string(ggml_type_name(k_type)) + "_k_f32";
++        ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_vec_f32[k_type], vec_name.c_str(), lightning_indexer_vec_f32_len, lightning_indexer_vec_f32_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {1, 1, 1}, {(uint32_t)k_type, fa_block_bytes(k_type)}, 1, true);
+     }
+ 
+     {
+@@ -10263,20 +10265,32 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
+     const ggml_tensor * w = dst->src[2];
+     const ggml_tensor * m = dst->src[3];
+ 
+-    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, q, k, w, dst, dst->op);
+-    GGML_ASSERT(pipeline != nullptr);
+-
+-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+-
+     const uint32_t n_kv      = k->ne[2];
+     const uint32_t n_heads   = q->ne[1];
+     const uint32_t n_tokens  = q->ne[2];
+     const uint32_t n_streams = q->ne[3];
+     const uint32_t n_masks   = m->ne[3];
+ 
+-    // one workgroup per tile of 64 keys and 8 tokens, see lightning_indexer.comp
++    // Decode variant for a few tokens (speculative verify, MTP drafts): one invocation per key, all heads and
++    // tokens, see lightning_indexer_vec.comp. It needs vec4-aligned q rows and, for f32/f16/bf16, key rows.
++    // GGML_VK_LID_VEC_MAX_TOKENS sets the largest batch that takes it (default 8, 0 = off).
++    static const uint32_t vec_max_tokens = getenv("GGML_VK_LID_VEC_MAX_TOKENS") ? (uint32_t)atoi(getenv("GGML_VK_LID_VEC_MAX_TOKENS")) : 8;
++    const size_t k_align = k->type == GGML_TYPE_F32 ? 16 : (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16) ? 8 : 1;
++    const bool use_vec = n_tokens <= vec_max_tokens && n_kv > 0 &&
++                         (q->nb[1] | q->nb[2] | q->nb[3]) % (4 * sizeof(float)) == 0 &&
++                         (k->nb[2] | k->nb[3]) % k_align == 0 &&
++                         ctx->device->pipeline_lightning_indexer_vec_f32[k->type] != nullptr;
++
++    vk_pipeline pipeline = use_vec ? ctx->device->pipeline_lightning_indexer_vec_f32[k->type] : ggml_vk_op_get_pipeline(ctx, q, k, w, dst, dst->op);
++    GGML_ASSERT(pipeline != nullptr);
++
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++
++    // tiled: one workgroup per tile of 64 keys and 8 tokens, see lightning_indexer.comp
+     const uint32_t n_tiles_kv = CEIL_DIV(n_kv, 64);
+-    const uint32_t n_tiles_t  = CEIL_DIV(n_tokens, 8);
++    // vec: one workgroup per 64 keys and token, so short contexts still fill the GPU (the key rows are re-read
++    // per token, from cache)
++    const uint32_t n_tiles_t  = use_vec ? n_tokens : CEIL_DIV(n_tokens, 8);
+ 
+     // q, w and dst are f32 and m is f16, so their strides are passed in elements;
+     // k may be quantized, so its strides stay in bytes
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/lightning_indexer_vec.comp b/ggml/src/ggml-vulkan/vulkan-shaders/lightning_indexer_vec.comp
+new file mode 100644
+index 000000000..6c0e83477
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/lightning_indexer_vec.comp
+@@ -0,0 +1,120 @@
++#version 450
++
++#extension GL_EXT_control_flow_attributes : require
++#extension GL_EXT_shader_16bit_storage : require
++#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
++#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
++
++#define BINDING_IDX_K 0u
++
++#include "types.glsl"
++#include "fa_types.glsl"
++#define FaTypeV GGML_TYPE_F32
++
++layout(constant_id = 0) const uint FaTypeK = GGML_TYPE_F32;
++layout(constant_id = 1) const uint FaBlockBytesK = 4;
++
++#include "flash_attn_dequant.glsl"
++
++// Decode variant of lightning_indexer.comp for a few query tokens (speculative verify, MTP drafts).
++// Each invocation owns one key: it holds the key row in registers and scores it against every head of every
++// token, so all the parallelism is over the keys and no invocation idles. q and the head weights are the same
++// for the whole workgroup (uniform loads), and everything is accumulated in fp32.
++// The host guarantees vec4-aligned q rows and, for f16/bf16/f32 keys, vec4-aligned key rows.
++#define HEAD_SIZE 128
++#define WG_SIZE   64
++
++layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
++
++layout(binding = 0) restrict readonly buffer QBuf { vec4 q4[]; };
++layout(binding = 1) restrict readonly buffer KBufF16V4 { f16vec4 k_f16v4[]; };
++layout(binding = 2) restrict readonly buffer WBuf { float weights[]; };
++layout(binding = 3) restrict readonly buffer MBuf { float16_t mask[]; };
++layout(binding = 4) restrict writeonly buffer DstBuf { float dst[]; };
++
++layout(push_constant) uniform PushConstants {
++    uint n_kv;
++    uint n_heads;
++    uint n_tokens;
++    uint n_masks;
++    uint q_nb1;
++    uint q_nb2;
++    uint q_nb3;
++    uint k_nb2;
++    uint k_nb3;
++    uint w_nb1;
++    uint w_nb3;
++    uint m_nb1;
++    uint m_nb3;
++    uint d_nb1;
++    uint d_nb3;
++};
++
++void main() {
++    const uint s  = gl_WorkGroupID.z;
++    const uint ik = gl_WorkGroupID.x * WG_SIZE + gl_LocalInvocationID.x;
++
++    if (fa_type_needs_shmem(FaTypeK)) {
++        init_iq_shmem(gl_WorkGroupSize);
++    }
++
++    // out-of-range invocations score a duplicate of the last key and do not store,
++    // so control flow around the uniform loads below stays uniform
++    const bool valid = ik < n_kv;
++    const uint ikc = valid ? ik : n_kv - 1;
++
++    const uint k_offset = ikc * k_nb2 + s * k_nb3; // bytes
++
++    vec4 kr[HEAD_SIZE / 4];
++    [[unroll]] for (uint c4 = 0; c4 < HEAD_SIZE / 4; ++c4) {
++        if (FaTypeK == GGML_TYPE_F16) {
++            kr[c4] = vec4(k_f16v4[k_offset / 8 + c4]);
++        } else if (FaTypeK == GGML_TYPE_F32) {
++            kr[c4] = k_packed_f32.data[k_offset / 16 + c4];
++        } else if (FaTypeK == GGML_TYPE_BF16) {
++            kr[c4] = bf16_to_fp32(uvec4(k_packed_bf16.data[k_offset / 8 + c4]));
++        } else {
++            const uint k_block_elems = fa_block_elems(FaTypeK);
++            kr[c4] = vec4(dequantize4((c4 * 4) / k_block_elems, (c4 * 4) % k_block_elems, k_offset / FaBlockBytesK, BINDING_IDX_K));
++        }
++    }
++
++    // the host spreads the tokens over gl_NumWorkGroups.y workgroups (one each in practice)
++    for (uint t = gl_WorkGroupID.y; t < n_tokens; t += gl_NumWorkGroups.y) {
++        const uint q_t = t * q_nb2 + s * q_nb3;
++        const uint w_t = t * w_nb1 + s * w_nb3;
++
++        float score = 0.0;
++
++        uint h = 0;
++        // two heads per step for more independent fma chains
++        for (; h + 1 < n_heads; h += 2) {
++            const uint qa = (q_t + h * q_nb1) / 4;
++            const uint qb = qa + q_nb1 / 4;
++            vec4 a = vec4(0.0);
++            vec4 b = vec4(0.0);
++            [[unroll]] for (uint c4 = 0; c4 < HEAD_SIZE / 4; ++c4) {
++                a = fma(kr[c4], q4[qa + c4], a);
++                b = fma(kr[c4], q4[qb + c4], b);
++            }
++            const float da = (a.x + a.y) + (a.z + a.w);
++            const float db = (b.x + b.y) + (b.z + b.w);
++            score += max(da, 0.0) * weights[w_t + h];
++            score += max(db, 0.0) * weights[w_t + h + 1];
++        }
++        if (h < n_heads) {
++            const uint qa = (q_t + h * q_nb1) / 4;
++            vec4 a = vec4(0.0);
++            [[unroll]] for (uint c4 = 0; c4 < HEAD_SIZE / 4; ++c4) {
++                a = fma(kr[c4], q4[qa + c4], a);
++            }
++            const float da = (a.x + a.y) + (a.z + a.w);
++            score += max(da, 0.0) * weights[w_t + h];
++        }
++
++        if (valid) {
++            const uint mask_offset = ik + t * m_nb1 + (s % n_masks) * m_nb3;
++            dst[ik + t * d_nb1 + s * d_nb3] = score + float(mask[mask_offset]);
++        }
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 8087e7a45..dd3bf9b39 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -1151,6 +1151,7 @@ void process_shaders() {
+     // K quant type is selected at runtime via the FaTypeK spec constant.
+     std::map<std::string, std::string> li_dict = {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}, {"DATA_A_IQ4_NL", "1"}};
+     string_to_spv("lightning_indexer_f32", "lightning_indexer.comp", li_dict);
++    string_to_spv("lightning_indexer_vec_f32", "lightning_indexer_vec.comp", li_dict);
+ 
+     string_to_spv("rwkv_wkv7_f32", "wkv7.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b78d6c458..fd15fe65d 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12278,6 +12278,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // decode-sized batches (speculative verify, MTP drafts): odd head counts, ragged key counts, several streams
++    for (int kv : { 1, 63, 65, 1000 }) {
++        for (int bs : { 2, 3, 8, 9 }) {
++            for (int nh : { 5, 32 }) {
++                for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
++                    test_cases.emplace_back(new test_lightning_indexer(128, nh, kv, bs, 2, 1, type_K));
++                }
++            }
++        }
++    }
++    // GLM-5.3-Flash DSA indexer (32 heads x 128, k-pool 4): 8K / 32K / 64K context -> 2K / 8K / 16K pooled keys
++    for (int kv : { 2048, 8192, 16384 }) {
++        for (int bs : { 1, 3 }) {
++            for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16}) {
++                test_cases.emplace_back(new test_lightning_indexer(128, 32, kv, bs, 1, 1, type_K));
++            }
++        }
++    }
++
+     return test_cases;
+ }
+ #ifdef _MSC_VER
+@@ -12764,6 +12783,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+ 
++    // GLM-5.3-Flash decode (32 heads x 128, k-pool 4): 8K / 32K / 64K context -> 2K / 8K / 16K pooled keys,
++    // 1 token (MTP draft, plain decode) and 3 tokens (MTP verify); the graph feeds f32 keys (gathered from the f16 cache)
++    for (int kv : { 2048, 8192, 16384 }) {
++        for (int bs : { 1, 3 }) {
++            for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16}) {
++                test_cases.emplace_back(new test_lightning_indexer(128, 32, kv, bs, 1, 1, type_K));
++            }
++        }
++    }
+     // lightning_indexer
+     for (int kv : { 256, 4096, 65536 }) {
+         for (int bs : { 1, 512, 2048 }) {
+-- 
+2.43.0
+

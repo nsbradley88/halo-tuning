@@ -1,0 +1,38 @@
+From 2cd73d7e0ff49c06b5b01b50b18ddcc932f02277 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:10:32 -0400
+Subject: [PATCH 05/23] glm5-next: contiguous transpose before the KDA conv
+ concat
+
+ggml_concat of the transposed projection read x with a stride of d_inner per element;
+on Vulkan each of the 102 concats took ~23 ms at 1.8K tokens (3.1 s per ubatch). A
+contiguous transpose first takes the tiled transpose-copy path. Decode (one token)
+keeps the plain view. ub 2048: prompt +15-22%.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/models/glm5-next.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/glm5-next.cpp b/src/models/glm5-next.cpp
+index 14224e64f..c25aedcb2 100644
+--- a/src/models/glm5-next.cpp
++++ b/src/models/glm5-next.cpp
+@@ -208,7 +208,13 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
+ 
+     ggml_tensor * x_proj = ggml_mul_mat(ctx0, proj_w, x);
+     ggml_tensor * x_3d   = ggml_reshape_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs);
+-    ggml_tensor * conv_x = ggml_concat(ctx0, conv_state_x, ggml_transpose(ctx0, x_3d), 0);
++    // Concatenating the transposed view directly reads x with a stride of d_inner per element (prefill: ~23 ms per
++    // concat at 1.8K tokens on Vulkan); a contiguous transpose first takes the tiled transpose-copy path.
++    ggml_tensor * x_t = ggml_transpose(ctx0, x_3d);
++    if (n_seq_tokens > 1) {
++        x_t = ggml_cont(ctx0, x_t);
++    }
++    ggml_tensor * conv_x = ggml_concat(ctx0, conv_state_x, x_t, 0);
+ 
+     // group s holds the conv window s tokens back.
+     // [TAG_RECURRENT_ROLLBACK_SPLITS]: the last K_rs tokens must share one ubatch.
+-- 
+2.43.0
+

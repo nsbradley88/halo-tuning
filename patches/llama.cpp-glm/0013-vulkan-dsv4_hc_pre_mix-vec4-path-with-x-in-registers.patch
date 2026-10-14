@@ -1,0 +1,269 @@
+From f662ed7ed527c840b1c6f17b54ed29a251ff5f26 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 08:33:25 +0000
+Subject: [PATCH 13/23] vulkan: dsv4_hc_pre_mix vec4 path with x in registers,
+ 1024 threads
+
+Reads x once (vec4, two per stream per invocation), derives pre per invocation
+so the subgroup-0 sinkhorn overlaps the stream collapse, and keeps y in
+registers for the norm. Scalar path stays for unaligned or wide rows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan-types.h      |   1 +
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          |  17 ++-
+ .../vulkan-shaders/dsv4_hc_pre_mix.comp       | 127 ++++++++++++++----
+ tests/test-backend-ops.cpp                    |   3 +
+ 4 files changed, 115 insertions(+), 33 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index 8bf302512..c3a36221e 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -972,6 +972,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_dsv4_hc_post_f32;
+     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
+     vk_pipeline pipeline_dsv4_hc_pre_mix_f32;
++    vk_pipeline pipeline_dsv4_hc_pre_mix_vec4_f32;
+     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
+     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
+     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 699b77f0c..bc0144950 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -3612,8 +3612,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+     // one token per workgroup; subgroup 0 runs the 4x4 sinkhorn in a 16-lane slice, as dsv4_hc_comb
+     if (device->subgroup_basic && device->subgroup_shuffle && device->subgroup_arithmetic && device->subgroup_require_full_support &&
+-        device->subgroup_size >= 16 && 512 / device->subgroup_size >= 2) {
+-        ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_mix_f32, "dsv4_hc_pre_mix_f32", dsv4_hc_pre_mix_f32_len, dsv4_hc_pre_mix_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_pre_mix_push_constants), {1, 1, 1}, { 512, device->subgroup_size }, 1, true, true, device->subgroup_size);
++        device->subgroup_size >= 16 && 1024 / device->subgroup_size >= 2) {
++        ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_mix_f32,      "dsv4_hc_pre_mix_f32",      dsv4_hc_pre_mix_f32_len, dsv4_hc_pre_mix_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_pre_mix_push_constants), {1, 1, 1}, { 1024, device->subgroup_size, 0 }, 1, true, true, device->subgroup_size);
++        ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_mix_vec4_f32, "dsv4_hc_pre_mix_vec4_f32", dsv4_hc_pre_mix_f32_len, dsv4_hc_pre_mix_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_pre_mix_push_constants), {1, 1, 1}, { 1024, device->subgroup_size, 1 }, 1, true, true, device->subgroup_size);
+     }
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,        "dsv4_hc_pre_f32",        dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
+@@ -7226,14 +7227,9 @@ void ggml_vk_dsv4_hc_pre_mix(ggml_backend_vk_context * ctx, vk_context& subctx,
+     const ggml_tensor * norm_w = dst->src[4];
+     VK_LOG_DEBUG("ggml_vk_dsv4_hc_pre_mix(" << x << ", " << mixes << ", " << dst << ")");
+ 
+-    vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_pre_mix_f32;
+-    GGML_ASSERT(pipeline != nullptr);
+-
+     const uint32_t n_embd   = (uint32_t)x->ne[0];
+     const uint32_t n_tokens = (uint32_t)x->ne[2];
+ 
+-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+-
+     const vk_subbuffer x_buf = ggml_vk_tensor_subbuffer(ctx, x,      true);
+     const vk_subbuffer m_buf = ggml_vk_tensor_subbuffer(ctx, mixes,  true);
+     const vk_subbuffer s_buf = ggml_vk_tensor_subbuffer(ctx, scale,  true);
+@@ -7261,6 +7257,13 @@ void ggml_vk_dsv4_hc_pre_mix(ggml_backend_vk_context * ctx, vk_context& subctx,
+     pc.w_offset = get_misalign_bytes(ctx, norm_w) / sizeof(float);
+     pc.d_offset = get_misalign_bytes(ctx, dst)    / sizeof(float);
+ 
++    // vec4 path: 16-byte aligned rows and x held in registers (2 vec4 per stream per invocation)
++    const bool vec4 = pc.nbx0 == 1 && pc.nbx1 % 4 == 0 && pc.nbx2 % 4 == 0 && n_embd % 4 == 0 && n_embd <= 4*1024*2 &&
++                      pc.x_offset % 4 == 0 && pc.w_offset % 4 == 0 && pc.d_offset % 4 == 0;
++    vk_pipeline pipeline = vec4 ? ctx->device->pipeline_dsv4_hc_pre_mix_vec4_f32 : ctx->device->pipeline_dsv4_hc_pre_mix_f32;
++    GGML_ASSERT(pipeline != nullptr);
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++
+     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, m_buf, s_buf, b_buf, w_buf, d_buf }, pc, { n_tokens, 1, 1 });
+ }
+ 
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_pre_mix.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_pre_mix.comp
+index d55d474ef..1a7e0de14 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_pre_mix.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_pre_mix.comp
+@@ -15,6 +15,9 @@
+ 
+ layout(constant_id = 0) const uint BLOCK_SIZE = 512;
+ layout(constant_id = 1) const uint SUBGROUP_SIZE = 32;
++// VEC4: x rows, norm_w and dst are 16-byte aligned and n_embd <= 4*BLOCK_SIZE*MAXV; x stays in registers
++layout(constant_id = 2) const uint VEC4 = 0;
++const uint MAXV = 2;
+ 
+ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+@@ -43,6 +46,9 @@ layout(push_constant) uniform parameter
+ };
+ 
+ layout(binding = 0, std430) readonly buffer X { float data_x[]; };
++layout(binding = 0, std430) readonly buffer X4 { vec4 data_x4[]; };
++layout(binding = 4, std430) readonly buffer W4 { vec4 data_w4[]; };
++layout(binding = 5, std430) buffer D4 { vec4 data_d4[]; };
+ layout(binding = 1, std430) readonly buffer M { float data_m[]; };
+ layout(binding = 2, std430) readonly buffer S { float data_s[]; };
+ layout(binding = 3, std430) readonly buffer B { float data_b[]; };
+@@ -54,7 +60,6 @@ const uint TAIL = 32;
+ const uint N_SUBGROUPS = BLOCK_SIZE / SUBGROUP_SIZE;
+ 
+ shared float red[N_SUBGROUPS];
+-shared float r_s;
+ shared float pre_s[hc];
+ 
+ float wg_sum(float v) {
+@@ -75,29 +80,8 @@ float sigmoid(float v) {
+     return 1.0f / (1.0f + exp(-v));
+ }
+ 
+-void main() {
+-    const uint tid = gl_LocalInvocationID.x;
+-    const uint it  = gl_WorkGroupID.x;
+-
+-    const uint xb = x_offset + it * nbx2;
+-    const uint yb = d_offset + it * n_embd;
+-    const uint tb = d_offset + n_tokens * n_embd + it * TAIL;
+-
+-    // pass 1: flat rms factor
+-    float r = 1.0f;
+-    if (fold_rms != 0) {
+-        float ss = 0.0f;
+-        [[unroll]] for (uint h = 0; h < hc; ++h) {
+-            for (uint i = tid; i < n_embd; i += BLOCK_SIZE) {
+-                const float v = data_x[xb + i * nbx0 + h * nbx1];
+-                ss = fma(v, v, ss);
+-            }
+-        }
+-        ss = wg_sum(ss);
+-        r = inversesqrt(ss / float(hc * n_embd) + rms_eps);
+-    }
+-
+-    // weights: subgroup 0 does all of it, the 4x4 sinkhorn in a 16-lane slice
++// subgroup 0: comb (16-lane sinkhorn), post and r/pad tail; pre_s only when WRITE_PRE
++void weights(const uint it, const uint tb, const float r, const bool write_pre) {
+     if (gl_SubgroupID == 0) {
+         const uint lane = gl_SubgroupInvocationID;
+         const uint idx  = lane & 15;    // idst + hc*isrc
+@@ -132,8 +116,10 @@ void main() {
+         }
+ 
+         if (lane < hc) {
+-            const float u = (data_m[m_offset + lane * nbm0 + it * nbm1] * r) * data_s[s_offset] + data_b[b_offset + lane * nbb0];
+-            pre_s[lane] = sigmoid(u) + hc_eps;
++            if (write_pre) {
++                const float u = (data_m[m_offset + lane * nbm0 + it * nbm1] * r) * data_s[s_offset] + data_b[b_offset + lane * nbb0];
++                pre_s[lane] = sigmoid(u) + hc_eps;
++            }
+         } else if (lane < 2*hc) {
+             const float u = (data_m[m_offset + lane * nbm0 + it * nbm1] * r) * data_s[s_offset + nbs0] + data_b[b_offset + lane * nbb0];
+             data_d[tb + lane - hc] = 2.0f * sigmoid(u);
+@@ -146,6 +132,87 @@ void main() {
+             data_d[tb + hc + hc*hc + lane] = 0.0f;
+         }
+     }
++}
++
++void main_vec4() {
++    const uint tid = gl_LocalInvocationID.x;
++    const uint it  = gl_WorkGroupID.x;
++    const uint nv  = n_embd / 4;
++
++    const uint xb = (x_offset + it * nbx2) / 4;
++    const uint s1 = nbx1 / 4;
++    const uint tb = d_offset + n_tokens * n_embd + it * TAIL;
++
++    vec4 xr[MAXV][hc];
++    float ss = 0.0f;
++    [[unroll]] for (uint k = 0; k < MAXV; ++k) {
++        const uint i = tid + k * BLOCK_SIZE;
++        [[unroll]] for (uint h = 0; h < hc; ++h) {
++            xr[k][h] = i < nv ? data_x4[xb + h * s1 + i] : vec4(0.0f);
++            ss += dot(xr[k][h], xr[k][h]);
++        }
++    }
++
++    float r = 1.0f;
++    if (fold_rms != 0) {
++        ss = wg_sum(ss);
++        r = inversesqrt(ss / float(hc * n_embd) + rms_eps);
++    }
++
++    // every invocation derives pre itself, so the sinkhorn in subgroup 0 overlaps with pass 2
++    float p[hc];
++    [[unroll]] for (uint h = 0; h < hc; ++h) {
++        const float u = (data_m[m_offset + h * nbm0 + it * nbm1] * r) * data_s[s_offset] + data_b[b_offset + h * nbb0];
++        p[h] = sigmoid(u) + hc_eps;
++    }
++
++    weights(it, tb, r, false);
++
++    vec4 y[MAXV];
++    float ss2 = 0.0f;
++    [[unroll]] for (uint k = 0; k < MAXV; ++k) {
++        vec4 v = vec4(0.0f);
++        [[unroll]] for (uint h = 0; h < hc; ++h) {
++            v = fma(xr[k][h], vec4(p[h]), v);
++        }
++        y[k] = v;
++        ss2 += dot(v, v);
++    }
++    ss2 = wg_sum(ss2);
++    const float scale = inversesqrt(ss2 / float(n_embd) + norm_eps);
++
++    const uint yb = (d_offset + it * n_embd) / 4;
++    [[unroll]] for (uint k = 0; k < MAXV; ++k) {
++        const uint i = tid + k * BLOCK_SIZE;
++        if (i < nv) {
++            data_d4[yb + i] = scale * y[k] * data_w4[w_offset / 4 + i];
++        }
++    }
++}
++
++void main_scalar() {
++    const uint tid = gl_LocalInvocationID.x;
++    const uint it  = gl_WorkGroupID.x;
++
++    const uint xb = x_offset + it * nbx2;
++    const uint yb = d_offset + it * n_embd;
++    const uint tb = d_offset + n_tokens * n_embd + it * TAIL;
++
++    // pass 1: flat rms factor
++    float r = 1.0f;
++    if (fold_rms != 0) {
++        float ss = 0.0f;
++        [[unroll]] for (uint h = 0; h < hc; ++h) {
++            for (uint i = tid; i < n_embd; i += BLOCK_SIZE) {
++                const float v = data_x[xb + i * nbx0 + h * nbx1];
++                ss = fma(v, v, ss);
++            }
++        }
++        ss = wg_sum(ss);
++        r = inversesqrt(ss / float(hc * n_embd) + rms_eps);
++    }
++
++    weights(it, tb, r, true);
+     barrier();
+ 
+     const float p0 = pre_s[0];
+@@ -173,3 +240,11 @@ void main() {
+         data_d[yb + i] = scale * data_d[yb + i] * data_w[w_offset + i];
+     }
+ }
++
++void main() {
++    if (VEC4 != 0) {
++        main_vec4();
++    } else {
++        main_scalar();
++    }
++}
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index a0e711d0d..b78d6c458 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9974,6 +9974,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+     test_cases.emplace_back(new test_dsv4_hc_pre_mix(64, 3, 1, true));
++    test_cases.emplace_back(new test_dsv4_hc_pre_mix(62, 3, 20, true));   // scalar path
++    test_cases.emplace_back(new test_dsv4_hc_pre_mix(62, 33, 20, false));
++    test_cases.emplace_back(new test_dsv4_hc_pre_mix(12288, 3, 20, true)); // scalar path (> vec4 register limit)
+     test_cases.emplace_back(new test_dsv4_hc_pre_mix(4096, 3, 1, false));
+     test_cases.emplace_back(new test_dsv4_hc_pre_mix(4096, 1, 20, true, 37.0f));
+     test_cases.emplace_back(new test_dsv4_hc_pre_mix(4096, 3, 20, true, 0.01f));
+-- 
+2.43.0
+

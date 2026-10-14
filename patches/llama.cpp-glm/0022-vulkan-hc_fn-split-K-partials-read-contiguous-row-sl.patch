@@ -1,0 +1,403 @@
+From 4d5c8ad67813a6f7af6e17cf42ad22a805ca98c3 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 17:28:28 +0000
+Subject: [PATCH 22/23] vulkan: hc_fn split-K partials read contiguous row
+ slices; parallel slice sum in pre_mix
+
+The first version cut K into 512-element slices per workgroup for all 24 rows,
+which scatters the weight reads into 24 small runs per workgroup (slow on
+LPDDR: 16-28 us cold). Workgroup (slice, row) now reduces one contiguous run of
+one row (8 slices of 2048 elements, 200 workgroups; the extra row computes the
+slice's sum of squares): 5.8 us cold in the server vs 12.1 us for the plain
+matvec at n=3. pre_mix stages the partials in shared memory with one load per
+invocation before summing them. Test hc_fn weights use realistic magnitudes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          |  11 +-
+ .../vulkan-shaders/dsv4_hc_mix_partials.comp  | 150 +++++++++---------
+ .../vulkan-shaders/dsv4_hc_pre_mix.comp       |  12 +-
+ src/models/glm5-next.cpp                      |   7 +-
+ tests/test-backend-ops.cpp                    |  31 +++-
+ 5 files changed, 126 insertions(+), 85 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 119f378fe..1b6c73dda 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -3632,7 +3632,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         device->subgroup_size >= 16 && 1024 / device->subgroup_size >= 2) {
+         ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_mix_f32,      "dsv4_hc_pre_mix_f32",      dsv4_hc_pre_mix_f32_len, dsv4_hc_pre_mix_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_pre_mix_push_constants), {1, 1, 1}, { 1024, device->subgroup_size, 0 }, 1, true, true, device->subgroup_size);
+         ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_mix_vec4_f32, "dsv4_hc_pre_mix_vec4_f32", dsv4_hc_pre_mix_f32_len, dsv4_hc_pre_mix_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_pre_mix_push_constants), {1, 1, 1}, { 1024, device->subgroup_size, 1 }, 1, true, true, device->subgroup_size);
+-        ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_mix_partials_q8_0, "dsv4_hc_mix_partials_q8_0", dsv4_hc_mix_partials_q8_0_len, dsv4_hc_mix_partials_q8_0_data, "main", 3, sizeof(vk_op_dsv4_hc_mix_partials_push_constants), {1, 1, 1}, { 256 }, 1);
++        ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_mix_partials_q8_0, "dsv4_hc_mix_partials_q8_0", dsv4_hc_mix_partials_q8_0_len, dsv4_hc_mix_partials_q8_0_data, "main", 3, sizeof(vk_op_dsv4_hc_mix_partials_push_constants), {1, 1, 1}, { 256, device->subgroup_size }, 1, true, true, device->subgroup_size);
+     }
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,        "dsv4_hc_pre_f32",        dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
+@@ -7296,7 +7296,8 @@ void ggml_vk_dsv4_hc_mix_partials(ggml_backend_vk_context * ctx, vk_context& sub
+         get_misalign_bytes(ctx, dst) / (uint32_t)sizeof(float),
+     };
+ 
+-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a_buf, x_buf, d_buf }, pc, { n_split, CEIL_DIV(n_tokens, 8u), 1 });
++    GGML_ASSERT(pc.x_offset % 4 == 0);
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a_buf, x_buf, d_buf }, pc, { n_split, (uint32_t)a->ne[1] + 1, CEIL_DIV(n_tokens, 8u) });
+ }
+ 
+ void ggml_vk_dsv4_hc_pre_mix(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+@@ -16388,7 +16389,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 // misalignment of a quantized src must be whole blocks, see the push constants
+                 return device->pipeline_dsv4_hc_mix_partials_q8_0 != nullptr && op->src[0]->type == GGML_TYPE_Q8_0 &&
+                        op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[1] <= 31 &&
+-                       op->src[0]->ne[0] % 512 == 0 && op->src[0]->ne[0] / 512 == ggml_get_op_params_i32(op, 0) &&
++                       (op->src[0]->ne[0] / 32) % ggml_get_op_params_i32(op, 0) == 0 &&
++                       ggml_get_op_params_i32(op, 0) <= 64 &&
+                        op->src[1]->ne[2] <= 65535 * 8;
+             }
+         case GGML_OP_DSV4_HC_PRE_MIX:
+@@ -16398,6 +16400,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                         return false;
+                     }
+                 }
++                if (ggml_get_op_params_i32(op, 7) != 0 && op->src[1]->ne[2] > 64) {
++                    return false; // split-K partials are staged in shared memory
++                }
+                 return device->pipeline_dsv4_hc_pre_mix_f32 != nullptr && op->src[0]->ne[1] == 4 &&
+                        op->src[0]->ne[2] <= 65535 && ggml_is_contiguous(op->src[4]);
+             }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_mix_partials.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_mix_partials.comp
+index f55919f31..159a6ad5d 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_mix_partials.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_mix_partials.comp
+@@ -2,111 +2,119 @@
+ 
+ #extension GL_EXT_control_flow_attributes : require
+ #extension GL_EXT_shader_16bit_storage : require
++#extension GL_KHR_shader_subgroup_basic : require
++#extension GL_KHR_shader_subgroup_arithmetic : require
+ 
+ #include "types.glsl"
+ 
+-// Split-K hc_fn matvec for few tokens (q8_0 weights, m <= 31 rows). Workgroup (p, g) multiplies the K slice p of
+-// SLICE_BLOCKS*32 elements with tokens g*NT .. g*NT+NT-1 and writes
+-//   dst[i, t, p] = sum over the slice of hc_fn[:, i] * x[:, t]    for i < m
+-//   dst[m, t, p] = sum over the slice of x[:, t]^2
+-//   dst[i, t, p] = 0                                              for m < i < 32
+-// ggml_dsv4_hc_pre_mix sums the slices. Per block: sum(q*x) * d, then the blocks of the slice in order.
++// Split-K hc_fn matvec for few tokens (q8_0 weights, m <= 31 rows). K is cut into n_split contiguous slices;
++// workgroup (s, row, g) reduces slice s of one weight row (a contiguous run of the row, good for DRAM) against
++// tokens g*NT .. g*NT+NT-1, so the grid has n_split*(m+1) workgroups instead of one per row. It writes
++//   dst[row, t, s] = sum over slice s of hc_fn[:, row] * x[:, t]    for row < m
++//   dst[m,   t, s] = sum over slice s of x[:, t]^2                  (workgroups with row == m, which also zero m+1..31)
++// ggml_dsv4_hc_pre_mix sums the slices.
+ 
+ layout(constant_id = 0) const uint BLOCK_SIZE = 256;
++layout(constant_id = 1) const uint SUBGROUP_SIZE = 32;
+ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+-const uint QK          = 32;
+-const uint SLICE_BLOCKS = 16;
+-const uint SLICE       = SLICE_BLOCKS * QK;
+-const uint NT          = 8;
+-const uint MAX_M       = 31;
+-const uint TAIL        = 32;
++const uint QK   = 32;
++const uint NT   = 8;
++const uint TAIL = 32;
++const uint N_SUBGROUPS = BLOCK_SIZE / SUBGROUP_SIZE;
+ 
+ layout(push_constant) uniform parameter
+ {
+     uint m;
+     uint k;           // elements per row of hc_fn = elements per token of x
+     uint n_tokens;
+-    uint n_split;     // k / SLICE
+-    uint a_offset;    // blocks
+-    uint x_offset;    // floats
++    uint n_split;
++    uint a_offset;    // q8_0 blocks
++    uint x_offset;    // floats, 16-byte aligned
+     uint d_offset;    // floats
+ };
+ 
+-layout(binding = 0, std430) readonly buffer A { block_q8_0 data_a[]; };
+-layout(binding = 1, std430) readonly buffer X { float data_x[]; };
++layout(binding = 0, std430) readonly buffer A { block_q8_0_packed16 data_a[]; };
++layout(binding = 1, std430) readonly buffer X { vec4 data_x4[]; };
+ layout(binding = 2, std430) writeonly buffer D { float data_d[]; };
+ 
+-shared float xs[NT * SLICE];
+-shared float part[MAX_M * SLICE_BLOCKS * NT];
+-shared float sq[NT * 32];
++shared float red[NT * N_SUBGROUPS];
+ 
+ void main() {
+     const uint tid = gl_LocalInvocationID.x;
+-    const uint p   = gl_WorkGroupID.x;
+-    const uint t0  = gl_WorkGroupID.y * NT;
++    const uint s   = gl_WorkGroupID.x;
++    const uint row = gl_WorkGroupID.y;
++    const uint t0  = gl_WorkGroupID.z * NT;
+     const uint nt  = min(NT, n_tokens - t0);
+-    const uint k0  = p * SLICE;
+ 
+-    for (uint idx = tid; idx < NT * SLICE; idx += BLOCK_SIZE) {
+-        const uint t = idx / SLICE;
+-        const uint j = idx % SLICE;
+-        xs[idx] = t < nt ? data_x[x_offset + (t0 + t) * k + k0 + j] : 0.0f;
+-    }
+-    barrier();
++    const uint nb     = k / QK;          // blocks per row
++    const uint sbk    = nb / n_split;    // blocks per slice
++    const uint b0     = s * sbk;
+ 
+-    // partial sums of squares: 32 invocations per token
+-    for (uint idx = tid; idx < NT * 32; idx += BLOCK_SIZE) {
+-        const uint t = idx / 32;
+-        const uint l = idx % 32;
+-        float s = 0.0f;
+-        for (uint j = l; j < SLICE; j += 32) {
+-            const float v = xs[t * SLICE + j];
+-            s = fma(v, v, s);
+-        }
+-        sq[idx] = s;
++    float acc[NT];
++    [[unroll]] for (uint t = 0; t < NT; ++t) {
++        acc[t] = 0.0f;
+     }
+ 
+-    // one (row, block) unit per invocation and round
+-    const uint nb_row = k / QK;
+-    for (uint u = tid; u < m * SLICE_BLOCKS; u += BLOCK_SIZE) {
+-        const uint row = u / SLICE_BLOCKS;
+-        const uint b   = u % SLICE_BLOCKS;
+-        const uint ib  = a_offset + row * nb_row + p * SLICE_BLOCKS + b;
+-        const float d  = float(data_a[ib].d);
++    // half blocks of 16 weights: 8 int16 words of int8 pairs, 4 vec4 of x per token
++    for (uint h = tid; h < 2 * sbk; h += BLOCK_SIZE) {
++        const uint b    = b0 + h / 2;
++        const uint hb = h % 2;
++        const uint xb   = (x_offset + b * QK + hb * 16) / 4;
+ 
+-        float acc[NT];
+-        [[unroll]] for (uint t = 0; t < NT; ++t) {
+-            acc[t] = 0.0f;
+-        }
+-        [[unroll]] for (uint j = 0; j < QK; ++j) {
+-            const float q = float(data_a[ib].qs[j]);
++        if (row < m) {
++            const uint ib = a_offset + row * nb + b;
++            const float d = float(data_a[ib].d);
++            float q[16];
++            [[unroll]] for (uint w = 0; w < 8; ++w) {
++                const int v = int(data_a[ib].qs[hb * 8 + w]);
++                q[2 * w    ] = float(bitfieldExtract(v, 0, 8));
++                q[2 * w + 1] = float(bitfieldExtract(v, 8, 8));
++            }
++            [[unroll]] for (uint t = 0; t < NT; ++t) {
++                if (t < nt) {
++                    float sum = 0.0f;
++                    [[unroll]] for (uint c = 0; c < 4; ++c) {
++                        const vec4 xv = data_x4[xb + (t0 + t) * (k / 4) + c];
++                        sum = fma(q[4 * c    ], xv.x, sum);
++                        sum = fma(q[4 * c + 1], xv.y, sum);
++                        sum = fma(q[4 * c + 2], xv.z, sum);
++                        sum = fma(q[4 * c + 3], xv.w, sum);
++                    }
++                    acc[t] = fma(sum, d, acc[t]);
++                }
++            }
++        } else {
+             [[unroll]] for (uint t = 0; t < NT; ++t) {
+-                acc[t] = fma(q, xs[t * SLICE + b * QK + j], acc[t]);
++                if (t < nt) {
++                    [[unroll]] for (uint c = 0; c < 4; ++c) {
++                        const vec4 xv = data_x4[xb + (t0 + t) * (k / 4) + c];
++                        acc[t] += dot(xv, xv);
++                    }
++                }
+             }
+         }
+-        [[unroll]] for (uint t = 0; t < NT; ++t) {
+-            part[(row * SLICE_BLOCKS + b) * NT + t] = acc[t] * d;
++    }
++
++    // workgroup reduction per token
++    [[unroll]] for (uint t = 0; t < NT; ++t) {
++        const float v = subgroupAdd(acc[t]);
++        if (gl_SubgroupInvocationID == 0) {
++            red[t * N_SUBGROUPS + gl_SubgroupID] = v;
+         }
+     }
+     barrier();
+ 
+-    for (uint w = tid; w < TAIL * NT; w += BLOCK_SIZE) {
+-        const uint i = w / NT;
+-        const uint t = w % NT;
+-        if (t >= nt) {
+-            continue;
+-        }
+-        float s = 0.0f;
+-        if (i < m) {
+-            [[unroll]] for (uint b = 0; b < SLICE_BLOCKS; ++b) {
+-                s += part[(i * SLICE_BLOCKS + b) * NT + t];
+-            }
+-        } else if (i == m) {
+-            for (uint l = 0; l < 32; ++l) {
+-                s += sq[t * 32 + l];
+-            }
++    if (tid < nt) {
++        float sum = 0.0f;
++        [[unroll]] for (uint i = 0; i < N_SUBGROUPS; ++i) {
++            sum += red[tid * N_SUBGROUPS + i];
+         }
+-        data_d[d_offset + (p * n_tokens + t0 + t) * TAIL + i] = s;
++        data_d[d_offset + (s * n_tokens + t0 + tid) * TAIL + row] = sum;
++    } else if (row == m && tid >= NT && tid < NT + nt * (TAIL - m - 1)) {
++        const uint w = tid - NT;
++        const uint t = w / (TAIL - m - 1);
++        const uint i = m + 1 + w % (TAIL - m - 1);
++        data_d[d_offset + (s * n_tokens + t0 + t) * TAIL + i] = 0.0f;
+     }
+ }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_pre_mix.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_pre_mix.comp
+index d19c056b8..40d61b688 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_pre_mix.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_pre_mix.comp
+@@ -64,6 +64,7 @@ const uint N_SUBGROUPS = BLOCK_SIZE / SUBGROUP_SIZE;
+ shared float red[N_SUBGROUPS];
+ shared float pre_s[hc];
+ shared float msum[TAIL];
++shared float ptmp[25 * 64];   // split-K partials of one token, n_split <= 64
+ 
+ // reads mix i of token it (raw, before * r)
+ float mix_raw(const uint it, const uint i) {
+@@ -77,10 +78,17 @@ void sum_partials(const uint it) {
+         return;
+     }
+     const uint tid = gl_LocalInvocationID.x;
+-    if (tid <= (2 + hc) * hc) {
++    const uint nm  = (2 + hc) * hc + 1;
++    for (uint idx = tid; idx < nm * n_split; idx += BLOCK_SIZE) {
++        const uint p = idx / nm;
++        const uint i = idx % nm;
++        ptmp[idx] = data_m[m_offset + i * nbm0 + it * nbm1 + p * nbm2];
++    }
++    barrier();
++    if (tid < nm) {
+         float acc = 0.0f;
+         for (uint p = 0; p < n_split; ++p) {
+-            acc += data_m[m_offset + tid * nbm0 + it * nbm1 + p * nbm2];
++            acc += ptmp[p * nm + tid];
+         }
+         msum[tid] = acc;
+     }
+diff --git a/src/models/glm5-next.cpp b/src/models/glm5-next.cpp
+index abb637938..355747a55 100644
+--- a/src/models/glm5-next.cpp
++++ b/src/models/glm5-next.cpp
+@@ -526,10 +526,11 @@ ggml_tensor * llama_model_glm5_next::graph::build_hc_pre(
+         // hc_fn*rms_norm(x) == r*(hc_fn*x) for the unweighted flat norm, so the op can apply r itself
+         const bool fold = cparams.fused_dsv4_hc_pre_mix_fold;
+         ggml_tensor * mixes = nullptr;
+-        if (fold && cparams.fused_hc_mix_split && nt <= 8 && hc_fn->type == GGML_TYPE_Q8_0 && hc_dim % 512 == 0) {
+-            // few tokens: split-K matvec into 512-element slices (24 rows alone leave most of the GPU idle);
++        static const int64_t split_elems = getenv("LLAMA_HC_MIX_SLICE") ? atoi(getenv("LLAMA_HC_MIX_SLICE")) : 2048;
++        if (fold && cparams.fused_hc_mix_split && nt <= 8 && hc_fn->type == GGML_TYPE_Q8_0 && hc_dim % split_elems == 0) {
++            // few tokens: split-K matvec into contiguous 2048-element slices (24 rows alone leave most of the GPU idle);
+             // the pre_mix op sums the slices and takes r from their sums of squares
+-            ggml_tensor * part = ggml_dsv4_hc_mix_partials(ctx0, hc_fn, x, (int32_t) (hc_dim / 512));
++            ggml_tensor * part = ggml_dsv4_hc_mix_partials(ctx0, hc_fn, x, (int32_t) (hc_dim / split_elems));
+             ggml_backend_dev_t dev = model.dev_layer(il);
+             if (dev != nullptr && ggml_backend_dev_supports_op(dev, part)) {
+                 mixes = part;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 7dd49b270..3ce1f93ca 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4369,6 +4369,11 @@ struct test_dsv4_hc : public test_case {
+             const std::string name = ggml_get_name(t);
+             float lo;
+             float hi;
++            if (name == "hc_fn") {
++                // realistic hc_fn magnitudes: large mixes saturate the sigmoids and amplify quantization noise
++                init_tensor_uniform(t, -0.05f, 0.05f);
++                continue;
++            }
+             if (!tensor_range(name, lo, hi)) {
+                 init_tensor_uniform(t);
+                 continue;
+@@ -4546,7 +4551,7 @@ struct test_dsv4_hc_pre_mix : public test_dsv4_hc {
+             ggml_tensor * hc_fn = ggml_new_tensor_2d(ctx, mm_type, hc*n_embd, (2 + hc)*hc);
+             ggml_set_name(hc_fn, "hc_fn");
+             if (split) {
+-                mixes = ggml_dsv4_hc_mix_partials(ctx, hc_fn, x, (int32_t) (hc*n_embd/512));
++                mixes = ggml_dsv4_hc_mix_partials(ctx, hc_fn, x, (int32_t) std::max<int64_t>(1, hc*n_embd/2048));
+             } else {
+                 ggml_tensor * flat = ggml_reshape_2d(ctx, x, hc*n_embd, n_tokens);
+                 if (!fold) {
+@@ -4574,6 +4579,7 @@ struct test_dsv4_hc_pre_mix : public test_dsv4_hc {
+ struct test_dsv4_hc_mix_partials : public test_dsv4_hc {
+     const int64_t n_embd;
+     const int64_t n_tokens;
++    const int32_t n_split;
+ 
+     std::string op_desc(ggml_tensor * t) override {
+         GGML_UNUSED(t);
+@@ -4581,19 +4587,20 @@ struct test_dsv4_hc_mix_partials : public test_dsv4_hc {
+     }
+ 
+     std::string vars() override {
+-        return VARS_TO_STR2(n_embd, n_tokens);
++        return VARS_TO_STR3(n_embd, n_tokens, n_split);
+     }
+ 
+     double max_nmse_err() override { return 1e-5; }
+ 
+-    test_dsv4_hc_mix_partials(int64_t n_embd = 4096, int64_t n_tokens = 3) : n_embd(n_embd), n_tokens(n_tokens) {}
++    test_dsv4_hc_mix_partials(int64_t n_embd = 4096, int64_t n_tokens = 3, int32_t n_split = 8)
++        : n_embd(n_embd), n_tokens(n_tokens), n_split(n_split) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+         ggml_set_name(x, "x");
+         ggml_tensor * hc_fn = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc*n_embd, (2 + hc)*hc);
+         ggml_set_name(hc_fn, "hc_fn");
+-        out = ggml_dsv4_hc_mix_partials(ctx, hc_fn, x, (int32_t) (hc*n_embd/512));
++        out = ggml_dsv4_hc_mix_partials(ctx, hc_fn, x, n_split);
+         ggml_set_name(out, "out");
+         return out;
+     }
+@@ -10169,9 +10176,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_dsv4_hc_pre_mix(4096, 3, 20, true, 37.0f, GGML_TYPE_Q8_0, true));
+     test_cases.emplace_back(new test_dsv4_hc_pre_mix(128, 3, 20, true, 1.0f, GGML_TYPE_Q8_0, true));
+     for (int64_t n_tokens : {1, 3, 8, 9, 17}) {
+-        test_cases.emplace_back(new test_dsv4_hc_mix_partials(4096, n_tokens));
++        test_cases.emplace_back(new test_dsv4_hc_mix_partials(4096, n_tokens, 8));
+     }
+-    test_cases.emplace_back(new test_dsv4_hc_mix_partials(128, 3));
++    test_cases.emplace_back(new test_dsv4_hc_mix_partials(4096, 3, 4));
++    test_cases.emplace_back(new test_dsv4_hc_mix_partials(4096, 3, 32));
++    test_cases.emplace_back(new test_dsv4_hc_mix_partials(4096, 3, 64));
++    test_cases.emplace_back(new test_dsv4_hc_mix_partials(128, 3, 1));
+ 
+     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
+     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
+@@ -12514,6 +12524,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+ 
+     add_glm_verify_mul_mat_cases(test_cases, true);
+ 
++    // glm5-next mHC: hc_fn matvec (plain vs split-K partials) and the pre_mix op that consumes it
++    for (int64_t n : {1, 3}) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 24, n, 16384, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_dsv4_hc_mix_partials(4096, n, 8));
++        test_cases.emplace_back(new test_dsv4_hc_pre_mix(4096, n, 20, true, 1.0f, GGML_TYPE_COUNT, false));
++        test_cases.emplace_back(new test_dsv4_hc_pre_mix(4096, n, 20, true, 1.0f, GGML_TYPE_Q8_0, false));
++        test_cases.emplace_back(new test_dsv4_hc_pre_mix(4096, n, 20, true, 1.0f, GGML_TYPE_Q8_0, true));
++    }
++
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
+-- 
+2.43.0
+

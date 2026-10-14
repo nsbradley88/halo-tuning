@@ -1,0 +1,1035 @@
+From 3cb36441e50c205b4e9c27ab7fb24565ddc39faf Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 08:21:21 +0000
+Subject: [PATCH 12/23] ggml, vulkan, glm5-next: fused mHC pre op
+ (DSV4_HC_PRE_MIX)
+
+One op per mHC block replaces the flat RMS_NORM, the pre/post affine+sigmoid
+chains, HC_COMB, HC_PRE and the following attn/ffn RMS_NORM_MUL. The flat norm
+has no weight, so hc_fn*rms_norm(x) = r*(hc_fn*x) and the op applies r itself
+(LLAMA_HC_PRE_MIX=nofold keeps the norm before hc_fn, =0 disables the op).
+Output: y [n_embd, n_tokens] then a 32-float tail per token with post|comb|r;
+DSV4_HC_POST reads post/comb as views. CPU reference, Vulkan shader (one
+workgroup per token, subgroup-shuffle sinkhorn as dsv4_hc_comb), probe in
+resolve_fused_ops, test-backend-ops cases with GLM shapes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/include/ggml.h                           |  31 ++++
+ ggml/src/ggml-backend-meta.cpp                |   3 +-
+ ggml/src/ggml-cpu/ggml-cpu.c                  |   5 +
+ ggml/src/ggml-cpu/ops.cpp                     | 145 +++++++++++++++
+ ggml/src/ggml-cpu/ops.h                       |   1 +
+ ggml/src/ggml-vulkan/ggml-vulkan-common.h     |   1 +
+ ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp    |   4 +
+ .../ggml-vulkan/ggml-vulkan-push-constants.h  |  23 +++
+ ggml/src/ggml-vulkan/ggml-vulkan-types.h      |   1 +
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          |  66 +++++++
+ .../vulkan-shaders/dsv4_hc_pre_mix.comp       | 175 ++++++++++++++++++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |   1 +
+ ggml/src/ggml.c                               |  86 ++++++++-
+ src/llama-context.cpp                         |  14 ++
+ src/llama-cparams.h                           |   2 +
+ src/llama-graph.h                             |   1 +
+ src/models/glm5-next.cpp                      |  30 ++-
+ src/models/models.h                           |   3 +-
+ tests/test-backend-ops.cpp                    |  80 ++++++++
+ 19 files changed, 659 insertions(+), 13 deletions(-)
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_pre_mix.comp
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 320745cb4..9123e609d 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -585,6 +585,7 @@ extern "C" {
+         GGML_OP_DSV4_HC_COMB,
+         GGML_OP_DSV4_HC_PRE,
+         GGML_OP_DSV4_HC_POST,
++        GGML_OP_DSV4_HC_PRE_MIX,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2726,6 +2727,36 @@ extern "C" {
+             struct ggml_tensor  * gate,
+             float                 scale);
+ 
++    // hc_pre_mix: the whole mHC "pre" half in one op (hc must be 4):
++    //   x      [n_embd, hc, n_tokens]   residual streams
++    //   mixes  [(2 + hc)*hc, n_tokens]  hc_fn * flat(x) (fold_rms) or hc_fn * rms_norm(flat(x))
++    //   scale  [3], base [(2 + hc)*hc], norm_w [n_embd]
++    // r       = fold_rms ? 1/sqrt(mean(flat(x)^2) + rms_eps) : 1
++    // pre[h]  = sigmoid((mixes[h]*r)*scale[0] + base[h]) + hc_eps
++    // post[h] = 2*sigmoid((mixes[hc + h]*r)*scale[1] + base[hc + h])
++    // comb    = ggml_dsv4_hc_comb() of mixes*r
++    // y[i]    = rms_norm(sum_h x[i, h]*pre[h], norm_eps)*norm_w[i]
++    // Result is a flat f32 tensor of (n_embd + 32)*n_tokens floats: y as a contiguous
++    // [n_embd, n_tokens] block, followed by a [32, n_tokens] tail per token holding
++    // post[hc] | comb[hc*hc] (dst-major, as hc_comb) | r | pad.
++    // Use ggml_dsv4_hc_pre_mix_{y,post,comb} for views.
++    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_mix(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * mixes,
++            struct ggml_tensor  * scale,
++            struct ggml_tensor  * base,
++            struct ggml_tensor  * norm_w,
++            float                 rms_eps,
++            float                 norm_eps,
++            float                 hc_eps,
++            int32_t               n_iter,
++            bool                  fold_rms);
++
++    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_mix_y   (struct ggml_context * ctx, struct ggml_tensor * pre_mix);
++    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_mix_post(struct ggml_context * ctx, struct ggml_tensor * pre_mix);
++    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_mix_comb(struct ggml_context * ctx, struct ggml_tensor * pre_mix);
++
+     // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
+     //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
+     //          -> [n_embd, hc, n_tokens]
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 86748b689..8d9afa7de 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1046,7 +1046,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             } break;
+             case GGML_OP_DSV4_HC_COMB:
+             case GGML_OP_DSV4_HC_PRE:
+-            case GGML_OP_DSV4_HC_POST: {
++            case GGML_OP_DSV4_HC_POST:
++            case GGML_OP_DSV4_HC_PRE_MIX: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+             } break;
+             case GGML_OP_UNARY: {
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 5428d5164..ed16da1ad 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2105,6 +2105,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_dsv4_hc_post(params, tensor);
+             } break;
++        case GGML_OP_DSV4_HC_PRE_MIX:
++            {
++                ggml_compute_forward_dsv4_hc_pre_mix(params, tensor);
++            } break;
+         case GGML_OP_MAP_CUSTOM1:
+             {
+                 ggml_compute_forward_map_custom1(params, tensor);
+@@ -2288,6 +2292,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_DSV4_HC_COMB:
+         case GGML_OP_DSV4_HC_PRE:
+         case GGML_OP_DSV4_HC_POST:
++        case GGML_OP_DSV4_HC_PRE_MIX:
+             {
+                 n_tasks = n_threads;
+             } break;
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index f07f51091..1e2595f4c 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11554,6 +11554,151 @@ void ggml_compute_forward_dsv4_hc_pre(
+     }
+ }
+ 
++// ggml_compute_forward_dsv4_hc_pre_mix
++
++static void ggml_compute_forward_dsv4_hc_pre_mix_f32(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * x      = dst->src[0];
++    const ggml_tensor * mixes  = dst->src[1];
++    const ggml_tensor * scale  = dst->src[2];
++    const ggml_tensor * base   = dst->src[3];
++    const ggml_tensor * norm_w = dst->src[4];
++
++    constexpr int64_t hc   = 4;
++    constexpr int64_t tail = 32;
++
++    const int64_t n_embd   = x->ne[0];
++    const int64_t n_tokens = x->ne[2];
++
++    GGML_ASSERT(x->ne[1] == hc);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_nelements(dst) == (n_embd + tail)*n_tokens);
++    GGML_ASSERT(ggml_is_contiguous(norm_w));
++
++    const float   rms_eps  = ggml_get_op_params_f32(dst, 0);
++    const float   norm_eps = ggml_get_op_params_f32(dst, 1);
++    const float   hc_eps   = ggml_get_op_params_f32(dst, 2);
++    const int32_t n_iter   = ggml_get_op_params_i32(dst, 3);
++    const bool    fold_rms = ggml_get_op_params_i32(dst, 4) != 0;
++
++    GGML_TENSOR_LOCALS(size_t, nbx, x,     nb);
++    GGML_TENSOR_LOCALS(size_t, nbm, mixes, nb);
++
++    const float * w  = (const float *) norm_w->data;
++    float       * d  = (float *) dst->data;
++
++    auto sc = [&](int64_t i) { return *(const float *) ((const char *) scale->data + i*scale->nb[0]); };
++    auto bs = [&](int64_t i) { return *(const float *) ((const char *) base->data  + i*base->nb[0]); };
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int64_t dr  = (n_tokens + nth - 1) / nth;
++    const int64_t it0 = dr * ith;
++    const int64_t it1 = MIN(it0 + dr, n_tokens);
++
++    for (int64_t it = it0; it < it1; ++it) {
++        const char * xt = (const char *) x->data + it*nbx2;
++
++        // flat rms factor over all hc*n_embd values (same as ggml_rms_norm of the flat row)
++        float r = 1.0f;
++        if (fold_rms) {
++            ggml_float sum = 0.0;
++            for (int64_t ih = 0; ih < hc; ++ih) {
++                for (int64_t i0 = 0; i0 < n_embd; ++i0) {
++                    const float v = *(const float *) (xt + i0*nbx0 + ih*nbx1);
++                    sum += (ggml_float)(v*v);
++                }
++            }
++            const float mean = sum/(hc*n_embd);
++            r = 1.0f/sqrtf(mean + rms_eps);
++        }
++
++        auto mix = [&](int64_t i) {
++            return *(const float *) ((const char *) mixes->data + i*nbm0 + it*nbm1) * r;
++        };
++
++        float * tl = d + n_embd*n_tokens + it*tail;
++
++        float pre[hc];
++        for (int64_t h = 0; h < hc; ++h) {
++            const float v = mix(h)*sc(0) + bs(h);
++            pre[h] = 1.0f/(1.0f + expf(-v)) + hc_eps;
++
++            const float u = mix(hc + h)*sc(1) + bs(hc + h);
++            tl[h] = 2.0f*(1.0f/(1.0f + expf(-u)));
++        }
++
++        // comb: identical to ggml_compute_forward_dsv4_hc_comb_f32
++        float comb[hc*hc];
++        for (int64_t isrc = 0; isrc < hc; ++isrc) {
++            float max = -INFINITY;
++            for (int64_t idst = 0; idst < hc; ++idst) {
++                const int64_t idx = idst + hc*isrc;
++                const float v = mix(2*hc + idx)*sc(2) + bs(2*hc + idx);
++                comb[idx] = v;
++                max = MAX(max, v);
++            }
++            float sum = 0.0f;
++            for (int64_t idst = 0; idst < hc; ++idst) {
++                const int64_t idx = idst + hc*isrc;
++                comb[idx] = expf(comb[idx] - max);
++                sum += comb[idx];
++            }
++            const float inv_sum = 1.0f/sum;
++            for (int64_t idst = 0; idst < hc; ++idst) {
++                const int64_t idx = idst + hc*isrc;
++                comb[idx] = comb[idx]*inv_sum + hc_eps;
++            }
++        }
++        ggml_dsv4_hc_comb_norm_cols(comb, hc_eps);
++        for (int32_t i = 1; i < n_iter; ++i) {
++            ggml_dsv4_hc_comb_norm_rows(comb, hc_eps);
++            ggml_dsv4_hc_comb_norm_cols(comb, hc_eps);
++        }
++        for (int64_t i = 0; i < hc*hc; ++i) {
++            tl[hc + i] = comb[i];
++        }
++        tl[hc + hc*hc] = r;
++        for (int64_t i = hc + hc*hc + 1; i < tail; ++i) {
++            tl[i] = 0.0f;
++        }
++
++        // collapse the streams, then rms_norm * w
++        float * y = d + it*n_embd;
++        ggml_float sum = 0.0;
++        for (int64_t i0 = 0; i0 < n_embd; ++i0) {
++            float v = 0.0f;
++            for (int64_t h = 0; h < hc; ++h) {
++                v += *(const float *) (xt + i0*nbx0 + h*nbx1) * pre[h];
++            }
++            y[i0] = v;
++            sum += (ggml_float)(v*v);
++        }
++        const float mean = sum/n_embd;
++        const float s    = 1.0f/sqrtf(mean + norm_eps);
++        for (int64_t i0 = 0; i0 < n_embd; ++i0) {
++            y[i0] = y[i0]*s*w[i0];
++        }
++    }
++}
++
++void ggml_compute_forward_dsv4_hc_pre_mix(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    switch (dst->src[0]->type) {
++        case GGML_TYPE_F32:
++            {
++                ggml_compute_forward_dsv4_hc_pre_mix_f32(params, dst);
++            } break;
++        default:
++            {
++                GGML_ABORT("fatal error");
++            }
++    }
++}
++
+ // ggml_compute_forward_dsv4_hc_post
+ 
+ static void ggml_compute_forward_dsv4_hc_post_f32(
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 2728b08b6..04b205e51 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -108,6 +108,7 @@ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * p
+ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_dsv4_hc_pre_mix(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-common.h b/ggml/src/ggml-vulkan/ggml-vulkan-common.h
+index edf140ccb..982a8cf6d 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-common.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-common.h
+@@ -101,6 +101,7 @@ vk_pipeline ggml_vk_get_quantize_pipeline(ggml_backend_vk_context * ctx, ggml_ty
+ void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t ne);
+ void ggml_vk_dsv4_hc_comb(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * mixes, const ggml_tensor * scale, const ggml_tensor * base, ggml_tensor * dst);
+ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * x, const ggml_tensor * weights, ggml_tensor * dst);
++void ggml_vk_dsv4_hc_pre_mix(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst);
+ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * x, const ggml_tensor * residual, const ggml_tensor * post, const ggml_tensor * comb, ggml_tensor * dst, const ggml_tensor * gate_scale_in = nullptr);
+ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
+ bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp b/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
+index a6fd22f99..51cc018d8 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
+@@ -1202,6 +1202,10 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
+             }
+         } else if (tensor->op == GGML_OP_DSV4_HC_POST) {
+             tensor_clone = ggml_dsv4_hc_post(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
++        } else if (tensor->op == GGML_OP_DSV4_HC_PRE_MIX) {
++            tensor_clone = ggml_dsv4_hc_pre_mix(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3], src_clone[4],
++                    ggml_get_op_params_f32(tensor, 0), ggml_get_op_params_f32(tensor, 1), ggml_get_op_params_f32(tensor, 2),
++                    ggml_get_op_params_i32(tensor, 3), ggml_get_op_params_i32(tensor, 4) != 0);
+         } else if (tensor->op == GGML_OP_MEAN) {
+             tensor_clone = ggml_mean(ggml_ctx, src_clone[0]);
+         } else if (tensor->op == GGML_OP_ARGMAX) {
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+index 04a03b2d5..d44f028ad 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+@@ -190,6 +190,29 @@ struct vk_op_dsv4_hc_pre_push_constants {
+     float scale;
+ };
+ 
++struct vk_op_dsv4_hc_pre_mix_push_constants {
++    uint32_t n_embd;
++    uint32_t n_tokens;
++
++    uint32_t nbx0; uint32_t nbx1; uint32_t nbx2;
++    uint32_t nbm0; uint32_t nbm1;
++    uint32_t nbs0;
++    uint32_t nbb0;
++
++    uint32_t x_offset;
++    uint32_t m_offset;
++    uint32_t s_offset;
++    uint32_t b_offset;
++    uint32_t w_offset;
++    uint32_t d_offset;
++
++    float    rms_eps;
++    float    norm_eps;
++    float    hc_eps;
++    uint32_t n_iter;
++    uint32_t fold_rms;
++};
++
+ struct vk_op_dsv4_hc_post_push_constants {
+     uint32_t n_embd;
+     uint32_t n_tokens;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index 560a86cdb..8bf302512 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -971,6 +971,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
+     vk_pipeline pipeline_dsv4_hc_post_f32;
+     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
++    vk_pipeline pipeline_dsv4_hc_pre_mix_f32;
+     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
+     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
+     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 9daee851b..699b77f0c 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -3610,6 +3610,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_comb_f32, "dsv4_hc_comb_f32", dsv4_hc_comb_f32_len, dsv4_hc_comb_f32_data, "main", 4, sizeof(vk_op_dsv4_hc_comb_push_constants), {tokens_per_workgroup, 1, 1}, { device->subgroup_size }, 1, true, true, device->subgroup_size);
+     }
+ 
++    // one token per workgroup; subgroup 0 runs the 4x4 sinkhorn in a 16-lane slice, as dsv4_hc_comb
++    if (device->subgroup_basic && device->subgroup_shuffle && device->subgroup_arithmetic && device->subgroup_require_full_support &&
++        device->subgroup_size >= 16 && 512 / device->subgroup_size >= 2) {
++        ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_mix_f32, "dsv4_hc_pre_mix_f32", dsv4_hc_pre_mix_f32_len, dsv4_hc_pre_mix_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_pre_mix_push_constants), {1, 1, 1}, { 512, device->subgroup_size }, 1, true, true, device->subgroup_size);
++    }
++
+     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,        "dsv4_hc_pre_f32",        dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f32,  "dsv4_hc_pre_gated_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
+@@ -7212,6 +7218,52 @@ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, cons
+     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, w_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
+ }
+ 
++void ggml_vk_dsv4_hc_pre_mix(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++    const ggml_tensor * x      = dst->src[0];
++    const ggml_tensor * mixes  = dst->src[1];
++    const ggml_tensor * scale  = dst->src[2];
++    const ggml_tensor * base   = dst->src[3];
++    const ggml_tensor * norm_w = dst->src[4];
++    VK_LOG_DEBUG("ggml_vk_dsv4_hc_pre_mix(" << x << ", " << mixes << ", " << dst << ")");
++
++    vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_pre_mix_f32;
++    GGML_ASSERT(pipeline != nullptr);
++
++    const uint32_t n_embd   = (uint32_t)x->ne[0];
++    const uint32_t n_tokens = (uint32_t)x->ne[2];
++
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++
++    const vk_subbuffer x_buf = ggml_vk_tensor_subbuffer(ctx, x,      true);
++    const vk_subbuffer m_buf = ggml_vk_tensor_subbuffer(ctx, mixes,  true);
++    const vk_subbuffer s_buf = ggml_vk_tensor_subbuffer(ctx, scale,  true);
++    const vk_subbuffer b_buf = ggml_vk_tensor_subbuffer(ctx, base,   true);
++    const vk_subbuffer w_buf = ggml_vk_tensor_subbuffer(ctx, norm_w, true);
++    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst,    true);
++
++    vk_op_dsv4_hc_pre_mix_push_constants pc = {
++        n_embd, n_tokens,
++        ggml_vk_nb_elem(x, 0), ggml_vk_nb_elem(x, 1), ggml_vk_nb_elem(x, 2),
++        ggml_vk_nb_elem(mixes, 0), ggml_vk_nb_elem(mixes, 1),
++        ggml_vk_nb_elem(scale, 0),
++        ggml_vk_nb_elem(base, 0),
++        0, 0, 0, 0, 0, 0,
++        ggml_get_op_params_f32(dst, 0),
++        ggml_get_op_params_f32(dst, 1),
++        ggml_get_op_params_f32(dst, 2),
++        (uint32_t)ggml_get_op_params_i32(dst, 3),
++        (uint32_t)ggml_get_op_params_i32(dst, 4),
++    };
++    pc.x_offset = get_misalign_bytes(ctx, x)      / sizeof(float);
++    pc.m_offset = get_misalign_bytes(ctx, mixes)  / sizeof(float);
++    pc.s_offset = get_misalign_bytes(ctx, scale)  / sizeof(float);
++    pc.b_offset = get_misalign_bytes(ctx, base)   / sizeof(float);
++    pc.w_offset = get_misalign_bytes(ctx, norm_w) / sizeof(float);
++    pc.d_offset = get_misalign_bytes(ctx, dst)    / sizeof(float);
++
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, m_buf, s_buf, b_buf, w_buf, d_buf }, pc, { n_tokens, 1, 1 });
++}
++
+ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * x, const ggml_tensor * residual, const ggml_tensor * post, const ggml_tensor * comb, ggml_tensor * dst, const ggml_tensor * gate_scale_in) {
+     VK_LOG_DEBUG("ggml_vk_dsv4_hc_post(" << x << ", " << residual << ", " << post << ", " << comb << ", " << dst << ")");
+ 
+@@ -12691,6 +12743,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
+     case GGML_OP_DSV4_HC_POST:
+         ggml_vk_dsv4_hc_post(ctx, compute_ctx, src0, src1, src2, src3, node);
+ 
++        break;
++    case GGML_OP_DSV4_HC_PRE_MIX:
++        ggml_vk_dsv4_hc_pre_mix(ctx, compute_ctx, node);
++
+         break;
+     case GGML_OP_MEAN:
+         ggml_vk_mean(ctx, compute_ctx, src0, node);
+@@ -16095,6 +16151,16 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 }
+                 return true;
+             }
++        case GGML_OP_DSV4_HC_PRE_MIX:
++            {
++                for (uint32_t i = 0; i < 5; ++i) {
++                    if (op->src[i]->type != GGML_TYPE_F32) {
++                        return false;
++                    }
++                }
++                return device->pipeline_dsv4_hc_pre_mix_f32 != nullptr && op->src[0]->ne[1] == 4 &&
++                       op->src[0]->ne[2] <= 65535 && ggml_is_contiguous(op->src[4]);
++            }
+         case GGML_OP_SOLVE_TRI:
+             {
+                 if (op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_pre_mix.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_pre_mix.comp
+new file mode 100644
+index 000000000..d55d474ef
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_hc_pre_mix.comp
+@@ -0,0 +1,175 @@
++#version 450
++
++#extension GL_EXT_control_flow_attributes : require
++#extension GL_KHR_shader_subgroup_basic : require
++#extension GL_KHR_shader_subgroup_shuffle : require
++#extension GL_KHR_shader_subgroup_arithmetic : require
++
++// The whole mHC "pre" half for one token per workgroup (hc = 4):
++//   r       = fold_rms ? inversesqrt(mean(x^2) + rms_eps) : 1     (flat rms of the 4 streams)
++//   pre[h]  = sigmoid((mixes[h]*r)*scale[0] + base[h]) + hc_eps
++//   post[h] = 2*sigmoid((mixes[4+h]*r)*scale[1] + base[4+h])
++//   comb    = sinkhorn(softmax((mixes[8..23]*r)*scale[2] + base[8..23]))   (as dsv4_hc_comb.comp)
++//   y       = rms_norm(sum_h x[:, h]*pre[h], norm_eps) * norm_w
++// dst: y as [n_embd, n_tokens], then a 32-float tail per token: post[4] | comb[16] | r | 0...
++
++layout(constant_id = 0) const uint BLOCK_SIZE = 512;
++layout(constant_id = 1) const uint SUBGROUP_SIZE = 32;
++
++layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
++
++layout(push_constant) uniform parameter
++{
++    uint n_embd;
++    uint n_tokens;
++
++    uint nbx0; uint nbx1; uint nbx2;   // x
++    uint nbm0; uint nbm1;              // mixes
++    uint nbs0;                         // scale
++    uint nbb0;                         // base
++
++    uint x_offset;
++    uint m_offset;
++    uint s_offset;
++    uint b_offset;
++    uint w_offset;
++    uint d_offset;
++
++    float rms_eps;
++    float norm_eps;
++    float hc_eps;
++    uint  n_iter;
++    uint  fold_rms;
++};
++
++layout(binding = 0, std430) readonly buffer X { float data_x[]; };
++layout(binding = 1, std430) readonly buffer M { float data_m[]; };
++layout(binding = 2, std430) readonly buffer S { float data_s[]; };
++layout(binding = 3, std430) readonly buffer B { float data_b[]; };
++layout(binding = 4, std430) readonly buffer W { float data_w[]; };
++layout(binding = 5, std430) buffer D { float data_d[]; };
++
++const uint hc   = 4;
++const uint TAIL = 32;
++const uint N_SUBGROUPS = BLOCK_SIZE / SUBGROUP_SIZE;
++
++shared float red[N_SUBGROUPS];
++shared float r_s;
++shared float pre_s[hc];
++
++float wg_sum(float v) {
++    v = subgroupAdd(v);
++    if (gl_SubgroupInvocationID == 0) {
++        red[gl_SubgroupID] = v;
++    }
++    barrier();
++    float s = 0.0f;
++    [[unroll]] for (uint i = 0; i < N_SUBGROUPS; ++i) {
++        s += red[i];
++    }
++    barrier();
++    return s;
++}
++
++float sigmoid(float v) {
++    return 1.0f / (1.0f + exp(-v));
++}
++
++void main() {
++    const uint tid = gl_LocalInvocationID.x;
++    const uint it  = gl_WorkGroupID.x;
++
++    const uint xb = x_offset + it * nbx2;
++    const uint yb = d_offset + it * n_embd;
++    const uint tb = d_offset + n_tokens * n_embd + it * TAIL;
++
++    // pass 1: flat rms factor
++    float r = 1.0f;
++    if (fold_rms != 0) {
++        float ss = 0.0f;
++        [[unroll]] for (uint h = 0; h < hc; ++h) {
++            for (uint i = tid; i < n_embd; i += BLOCK_SIZE) {
++                const float v = data_x[xb + i * nbx0 + h * nbx1];
++                ss = fma(v, v, ss);
++            }
++        }
++        ss = wg_sum(ss);
++        r = inversesqrt(ss / float(hc * n_embd) + rms_eps);
++    }
++
++    // weights: subgroup 0 does all of it, the 4x4 sinkhorn in a 16-lane slice
++    if (gl_SubgroupID == 0) {
++        const uint lane = gl_SubgroupInvocationID;
++        const uint idx  = lane & 15;    // idst + hc*isrc
++
++        float v = (data_m[m_offset + (2*hc + idx) * nbm0 + it * nbm1] * r) * data_s[s_offset + 2 * nbs0]
++                + data_b[b_offset + (2*hc + idx) * nbb0];
++
++        float vmax = max(v, subgroupShuffleXor(v, 1));
++        vmax = max(vmax, subgroupShuffleXor(vmax, 2));
++        v = exp(v - vmax);
++
++        float sum = v + subgroupShuffleXor(v, 1);
++        sum += subgroupShuffleXor(sum, 2);
++        v = v / sum + hc_eps;
++
++        sum = v + subgroupShuffleXor(v, 4);
++        sum += subgroupShuffleXor(sum, 8);
++        v /= sum + hc_eps;
++
++        for (uint i = 1; i < n_iter; ++i) {
++            sum = v + subgroupShuffleXor(v, 1);
++            sum += subgroupShuffleXor(sum, 2);
++            v /= sum + hc_eps;
++
++            sum = v + subgroupShuffleXor(v, 4);
++            sum += subgroupShuffleXor(sum, 8);
++            v /= sum + hc_eps;
++        }
++
++        if (lane < 16) {
++            data_d[tb + hc + idx] = v;
++        }
++
++        if (lane < hc) {
++            const float u = (data_m[m_offset + lane * nbm0 + it * nbm1] * r) * data_s[s_offset] + data_b[b_offset + lane * nbb0];
++            pre_s[lane] = sigmoid(u) + hc_eps;
++        } else if (lane < 2*hc) {
++            const float u = (data_m[m_offset + lane * nbm0 + it * nbm1] * r) * data_s[s_offset + nbs0] + data_b[b_offset + lane * nbb0];
++            data_d[tb + lane - hc] = 2.0f * sigmoid(u);
++        }
++    } else if (gl_SubgroupID == 1) {
++        const uint lane = gl_SubgroupInvocationID;
++        if (lane == 0) {
++            data_d[tb + hc + hc*hc] = r;
++        } else if (hc + hc*hc + lane < TAIL) {
++            data_d[tb + hc + hc*hc + lane] = 0.0f;
++        }
++    }
++    barrier();
++
++    const float p0 = pre_s[0];
++    const float p1 = pre_s[1];
++    const float p2 = pre_s[2];
++    const float p3 = pre_s[3];
++
++    // pass 2: collapse the streams (same fma order as dsv4_hc_pre.comp)
++    float ss2 = 0.0f;
++    for (uint i = tid; i < n_embd; i += BLOCK_SIZE) {
++        const uint xi = xb + i * nbx0;
++        float y = 0.0f;
++        y = fma(data_x[xi           ], p0, y);
++        y = fma(data_x[xi +     nbx1], p1, y);
++        y = fma(data_x[xi + 2 * nbx1], p2, y);
++        y = fma(data_x[xi + 3 * nbx1], p3, y);
++        data_d[yb + i] = y;
++        ss2 = fma(y, y, ss2);
++    }
++    ss2 = wg_sum(ss2);
++    const float scale = inversesqrt(ss2 / float(n_embd) + norm_eps);
++
++    // pass 3: rms_norm * w, each invocation rereads only its own writes
++    for (uint i = tid; i < n_embd; i += BLOCK_SIZE) {
++        data_d[yb + i] = scale * data_d[yb + i] * data_w[w_offset + i];
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 96cd49dac..8087e7a45 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -1110,6 +1110,7 @@ void process_shaders() {
+     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
+     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
+     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
++    string_to_spv("dsv4_hc_pre_mix_f32", "dsv4_hc_pre_mix.comp", {});
+     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("cumsum_multipass2_f32", "cumsum_multipass2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 972c0fc3f..7a1a0d9b5 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1084,6 +1084,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "DSV4_HC_COMB",
+     "DSV4_HC_PRE",
+     "DSV4_HC_POST",
++    "DSV4_HC_PRE_MIX",
+ 
+     "UNARY",
+ 
+@@ -1101,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1199,6 +1200,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "dsv4_hc_comb(mixes, scale, base)",
+     "dsv4_hc_pre(x, weights)",
+     "dsv4_hc_post(x, residual, post, comb)",
++    "dsv4_hc_pre_mix(x, mixes, scale, base, norm_w)",
+ 
+     "unary(x)",
+ 
+@@ -1216,7 +1218,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6617,6 +6619,86 @@ struct ggml_tensor * ggml_dsv4_hc_pre_gated(
+     return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true);
+ }
+ 
++// ggml_dsv4_hc_pre_mix
++
++#define GGML_DSV4_HC_PRE_MIX_TAIL 32
++
++struct ggml_tensor * ggml_dsv4_hc_pre_mix(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * mixes,
++        struct ggml_tensor  * scale,
++        struct ggml_tensor  * base,
++        struct ggml_tensor  * norm_w,
++        float                 rms_eps,
++        float                 norm_eps,
++        float                 hc_eps,
++        int32_t               n_iter,
++        bool                  fold_rms) {
++    GGML_ASSERT(x->type      == GGML_TYPE_F32);
++    GGML_ASSERT(mixes->type  == GGML_TYPE_F32);
++    GGML_ASSERT(scale->type  == GGML_TYPE_F32);
++    GGML_ASSERT(base->type   == GGML_TYPE_F32);
++    GGML_ASSERT(norm_w->type == GGML_TYPE_F32);
++    GGML_ASSERT(n_iter > 0);
++
++    const int64_t n_embd   = x->ne[0];
++    const int64_t hc       = x->ne[1];
++    const int64_t n_tokens = x->ne[2];
++
++    GGML_ASSERT(hc == 4);
++    GGML_ASSERT(x->ne[3] == 1);
++    GGML_ASSERT(mixes->ne[0] == (2 + hc)*hc);
++    GGML_ASSERT(mixes->ne[1] == n_tokens);
++    GGML_ASSERT(mixes->ne[2] == 1 && mixes->ne[3] == 1);
++    GGML_ASSERT(scale->ne[0] >= 3);
++    GGML_ASSERT(ggml_nelements(base) == (2 + hc)*hc);
++    GGML_ASSERT(ggml_nelements(norm_w) == n_embd);
++    GGML_ASSERT(ggml_is_contiguous(norm_w));
++
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (n_embd + GGML_DSV4_HC_PRE_MIX_TAIL)*n_tokens);
++
++    ggml_set_op_params_f32(result, 0, rms_eps);
++    ggml_set_op_params_f32(result, 1, norm_eps);
++    ggml_set_op_params_f32(result, 2, hc_eps);
++    ggml_set_op_params_i32(result, 3, n_iter);
++    ggml_set_op_params_i32(result, 4, fold_rms ? 1 : 0);
++    ggml_set_op_params_i32(result, 5, (int32_t) n_embd);
++    ggml_set_op_params_i32(result, 6, (int32_t) n_tokens);
++
++    result->op     = GGML_OP_DSV4_HC_PRE_MIX;
++    result->src[0] = x;
++    result->src[1] = mixes;
++    result->src[2] = scale;
++    result->src[3] = base;
++    result->src[4] = norm_w;
++
++    return result;
++}
++
++struct ggml_tensor * ggml_dsv4_hc_pre_mix_y(struct ggml_context * ctx, struct ggml_tensor * pre_mix) {
++    GGML_ASSERT(pre_mix->op == GGML_OP_DSV4_HC_PRE_MIX);
++    const int64_t n_embd   = ggml_get_op_params_i32(pre_mix, 5);
++    const int64_t n_tokens = ggml_get_op_params_i32(pre_mix, 6);
++    return ggml_view_2d(ctx, pre_mix, n_embd, n_tokens, n_embd*sizeof(float), 0);
++}
++
++struct ggml_tensor * ggml_dsv4_hc_pre_mix_post(struct ggml_context * ctx, struct ggml_tensor * pre_mix) {
++    GGML_ASSERT(pre_mix->op == GGML_OP_DSV4_HC_PRE_MIX);
++    const int64_t n_embd   = ggml_get_op_params_i32(pre_mix, 5);
++    const int64_t n_tokens = ggml_get_op_params_i32(pre_mix, 6);
++    return ggml_view_2d(ctx, pre_mix, 4, n_tokens, GGML_DSV4_HC_PRE_MIX_TAIL*sizeof(float),
++            n_embd*n_tokens*sizeof(float));
++}
++
++struct ggml_tensor * ggml_dsv4_hc_pre_mix_comb(struct ggml_context * ctx, struct ggml_tensor * pre_mix) {
++    GGML_ASSERT(pre_mix->op == GGML_OP_DSV4_HC_PRE_MIX);
++    const int64_t n_embd   = ggml_get_op_params_i32(pre_mix, 5);
++    const int64_t n_tokens = ggml_get_op_params_i32(pre_mix, 6);
++    return ggml_view_3d(ctx, pre_mix, 4, 4, n_tokens, 4*sizeof(float), GGML_DSV4_HC_PRE_MIX_TAIL*sizeof(float),
++            (n_embd*n_tokens + 4)*sizeof(float));
++}
++
+ // ggml_dsv4_hc_post
+ 
+ struct ggml_tensor * ggml_dsv4_hc_post(
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 23170d8a3..3d33f93b9 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -165,6 +165,12 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
+     /*.n_tokens_per_seq =*/ 1,
+ };
+ 
++static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_mix_probe = {
++    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE_MIX,
++    /*.name             =*/ "fused DeepSeek V4 HC pre mix",
++    /*.n_tokens_per_seq =*/ 1,
++};
++
+ llama_context::llama_context(
+         const llama_model & model,
+               llama_context_params params) :
+@@ -328,6 +334,13 @@ llama_context::llama_context(
+     cparams.fused_dsv4_hc_post = true;
+     cparams.auto_fhc           = true;
+ 
++    // LLAMA_HC_PRE_MIX=0 disables the fused mHC pre op, =nofold keeps the flat rms_norm before hc_fn
++    {
++        const char * env = getenv("LLAMA_HC_PRE_MIX");
++        cparams.fused_dsv4_hc_pre_mix      = !(env && strcmp(env, "0") == 0);
++        cparams.fused_dsv4_hc_pre_mix_fold = !(env && strcmp(env, "nofold") == 0);
++    }
++
+     // with causal attention, the batch size is limited by the context size
+     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
+ 
+@@ -669,6 +682,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+         resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
+         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
+         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
++        resolve(llm_fused_op_dsv4_hc_pre_mix_probe, cparams.fused_dsv4_hc_pre_mix);
+         cparams.auto_fhc = false;
+     }
+ }
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index f4eb181a7..c04eceb7d 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -47,6 +47,8 @@ struct llama_cparams {
+     bool fused_dsv4_hc_pre;
+     bool fused_dsv4_hc_comb;
+     bool fused_dsv4_hc_post;
++    bool fused_dsv4_hc_pre_mix;      // whole mHC pre half in one op (glm5-next)
++    bool fused_dsv4_hc_pre_mix_fold; // fold the flat rms norm into the pre_mix op
+     bool auto_fhc;
+     bool no_perf;
+     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index e15d78450..c68f14b15 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -53,6 +53,7 @@ enum llm_fused_op {
+     LLM_FUSED_OP_DSV4_HC_PRE,
+     LLM_FUSED_OP_DSV4_HC_COMB,
+     LLM_FUSED_OP_DSV4_HC_POST,
++    LLM_FUSED_OP_DSV4_HC_PRE_MIX,
+ };
+ 
+ enum llm_ffn_op_type : int {
+diff --git a/src/models/glm5-next.cpp b/src/models/glm5-next.cpp
+index 068327a97..61a072204 100644
+--- a/src/models/glm5-next.cpp
++++ b/src/models/glm5-next.cpp
+@@ -508,6 +508,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_hc_pre(
+         ggml_tensor * hc_fn,
+         ggml_tensor * hc_scale,
+         ggml_tensor * hc_base,
++        ggml_tensor * norm_w,
+         ggml_tensor ** post,
+         ggml_tensor ** comb,
+         int il) const {
+@@ -520,6 +521,23 @@ ggml_tensor * llama_model_glm5_next::graph::build_hc_pre(
+     GGML_ASSERT(hc_fn->ne[1] == hc_mix_dim);
+ 
+     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc_dim, nt);
++
++    if (cparams.fused_dsv4_hc_pre_mix && il >= 0) {
++        // hc_fn*rms_norm(x) == r*(hc_fn*x) for the unweighted flat norm, so the op can apply r itself
++        const bool fold = cparams.fused_dsv4_hc_pre_mix_fold;
++        ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, fold ? flat : ggml_rms_norm(ctx0, flat, norm_rms_eps));
++        cb(mixes, "hc_mixes", il);
++
++        ggml_tensor * mix = ggml_dsv4_hc_pre_mix(ctx0, x, mixes, hc_scale, hc_base, norm_w,
++                norm_rms_eps, norm_rms_eps, hparams.dsv4_hc_eps, (int32_t) hparams.dsv4_hc_sinkhorn_iters, fold);
++        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE_MIX, mix, il});
++        cb(mix, "hc_pre_mix", il);
++
++        *post = ggml_dsv4_hc_pre_mix_post(ctx0, mix);
++        *comb = ggml_dsv4_hc_pre_mix_comb(ctx0, mix);
++        return ggml_dsv4_hc_pre_mix_y(ctx0, mix);
++    }
++
+     ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
+     ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
+     cb(mixes, "hc_mixes", il);
+@@ -558,7 +576,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_hc_pre(
+     cb(*comb, "hc_comb", il);
+ 
+     ggml_tensor * result = build_hc_pre(x, pre, il);
+-    return result;
++    return build_norm(result, norm_w, nullptr, LLM_NORM_RMS, il);
+ }
+ 
+ ggml_tensor * llama_model_glm5_next::graph::build_hc_post(
+@@ -778,10 +796,7 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
+         ggml_tensor * post = nullptr;
+         ggml_tensor * comb = nullptr;
+ 
+-        cur = build_hc_pre(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, &post, &comb, il);
+-        cb(cur, "hc_attn_pre", il);
+-
+-        cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
++        cur = build_hc_pre(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, layer.attn_norm, &post, &comb, il);
+         cb(cur, "attn_norm", il);
+         ggml_build_forward_expand(gf, cur);
+ 
+@@ -796,10 +811,7 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
+         cb(inpL, "hc_attn_post", il);
+ 
+         residual = inpL;
+-        cur = build_hc_pre(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &post, &comb, il);
+-        cb(cur, "hc_ffn_pre", il);
+-
+-        cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
++        cur = build_hc_pre(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, layer.ffn_norm, &post, &comb, il);
+         cb(cur, "ffn_norm", il);
+ 
+         if ((uint32_t) il < hparams.n_layer_dense_lead) {
+diff --git a/src/models/models.h b/src/models/models.h
+index c760b8982..62b9991f1 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2804,12 +2804,13 @@ struct llama_model_glm5_next : public llama_model_base {
+         // mean over the hyper-connection streams: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
+         ggml_tensor * build_hc_mean(ggml_tensor * x) const;
+ 
+-        // returns the collapsed input and fills the post / comb weights
++        // returns the collapsed input, rms-normed with norm_w, and fills the post / comb weights
+         ggml_tensor * build_hc_pre(
+                 ggml_tensor * x,
+                 ggml_tensor * hc_fn,
+                 ggml_tensor * hc_scale,
+                 ggml_tensor * hc_base,
++                ggml_tensor * norm_w,
+                 ggml_tensor ** post,
+                 ggml_tensor ** comb,
+                 int il) const;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 7212300f6..a0e711d0d 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4505,6 +4505,67 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
+ };
+ 
+ 
++struct test_dsv4_hc_pre_mix : public test_dsv4_hc {
++    const int64_t n_embd;
++    const int64_t n_tokens;
++    const int32_t n_iter;
++    const bool    fold;
++    const float   x_scale;   // != 1: scale x in-graph to test large/small norms
++    const ggml_type mm_type; // GGML_TYPE_COUNT: mixes is an input, else mixes = hc_fn(mm_type) * x as in glm5-next
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "DSV4_HC_PRE_MIX";
++    }
++
++    std::string vars() override {
++        return VARS_TO_STR6(n_embd, n_tokens, n_iter, fold, x_scale, mm_type);
++    }
++
++    bool run_whole_graph() override { return mm_type != GGML_TYPE_COUNT || x_scale != 1.0f; }
++
++    double max_nmse_err() override { return mm_type == GGML_TYPE_COUNT ? 1e-6 : 5e-4; }
++
++    test_dsv4_hc_pre_mix(int64_t n_embd = 64, int64_t n_tokens = 3, int32_t n_iter = 20, bool fold = true,
++            float x_scale = 1.0f, ggml_type mm_type = GGML_TYPE_COUNT)
++        : n_embd(n_embd), n_tokens(n_tokens), n_iter(n_iter), fold(fold), x_scale(x_scale), mm_type(mm_type) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
++        ggml_set_name(x, "x");
++        if (x_scale != 1.0f) {
++            x = ggml_scale(ctx, x, x_scale);
++        }
++
++        ggml_tensor * mixes;
++        if (mm_type == GGML_TYPE_COUNT) {
++            mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2 + hc)*hc, n_tokens);
++            ggml_set_name(mixes, "mixes");
++        } else {
++            ggml_tensor * hc_fn = ggml_new_tensor_2d(ctx, mm_type, hc*n_embd, (2 + hc)*hc);
++            ggml_set_name(hc_fn, "hc_fn");
++            ggml_tensor * flat = ggml_reshape_2d(ctx, x, hc*n_embd, n_tokens);
++            if (!fold) {
++                flat = ggml_rms_norm(ctx, flat, 1e-6f);
++            }
++            mixes = ggml_mul_mat(ctx, hc_fn, flat);
++        }
++
++        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
++        ggml_set_name(scale, "scale");
++
++        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
++        ggml_set_name(base, "base");
++
++        ggml_tensor * norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
++        ggml_set_name(norm_w, "norm_w");
++
++        out = ggml_dsv4_hc_pre_mix(ctx, x, mixes, scale, base, norm_w, 1e-6f, 1e-5f, 1e-6f, n_iter, fold);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // GGML_OP_SSM_CONV
+ struct test_ssm_conv : public test_case {
+     const ggml_type type;
+@@ -9903,6 +9964,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
+     }
+ 
++    for (int64_t n_embd : {64, 4096}) {
++        for (int64_t n_tokens : {1, 2, 3, 7, 33, 1024}) {
++            if (n_embd == 64 && n_tokens == 1024) {
++                continue;
++            }
++            test_cases.emplace_back(new test_dsv4_hc_pre_mix(n_embd, n_tokens, 20, true));
++            test_cases.emplace_back(new test_dsv4_hc_pre_mix(n_embd, n_tokens, 20, false));
++        }
++    }
++    test_cases.emplace_back(new test_dsv4_hc_pre_mix(64, 3, 1, true));
++    test_cases.emplace_back(new test_dsv4_hc_pre_mix(4096, 3, 1, false));
++    test_cases.emplace_back(new test_dsv4_hc_pre_mix(4096, 1, 20, true, 37.0f));
++    test_cases.emplace_back(new test_dsv4_hc_pre_mix(4096, 3, 20, true, 0.01f));
++    for (int64_t n_tokens : {1, 3, 1024}) {
++        test_cases.emplace_back(new test_dsv4_hc_pre_mix(4096, n_tokens, 20, true,  1.0f, GGML_TYPE_F32));
++        test_cases.emplace_back(new test_dsv4_hc_pre_mix(4096, n_tokens, 20, true,  1.0f, GGML_TYPE_Q8_0));
++        test_cases.emplace_back(new test_dsv4_hc_pre_mix(4096, n_tokens, 20, false, 1.0f, GGML_TYPE_Q8_0));
++    }
++
+     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
+     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
+     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
+-- 
+2.43.0
+

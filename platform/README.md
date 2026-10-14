@@ -13,6 +13,8 @@ Strata ran on ROCm 7.14.1 (AMD TheRock tarball for gfx1151).
 | GTT pool 112 GiB: `ttm.pages_limit=29360128 ttm.page_pool_size=29360128` (was 104 GiB) | room for big models + KV + compute buffers | with `amd_iommu=off`: Strata prompt +8–9%, output +2–8%; llama.cpp prompt +7% |
 | `amd_iommu=off` | matches the Strata maintainers' gfx1151 host | see above; **drops DMA protection for USB4/Thunderbolt devices** |
 | Platform profile `performance`, on AC | — | the package still holds a hard 70 W |
+| `kho=off` (Ubuntu 7.0 kernels) | kexec-handover marks ~8.7 GiB as CMA by default; TTM can't use it | required for GLM-5.3-Flash (~110 GiB): loads above ~116 GiB OOMed or crashed the box without it |
+| GTT pool 120 GiB, multi-user target (no GUI): `ttm.pages_limit=31457280` | room for a ~110 GiB model + 64K context + MTP | GLM-5.3-Flash only; ~8–9 GiB stays free, so run it with a MemAvailable watchdog |
 
 ## Lessons
 
@@ -40,6 +42,11 @@ Strata ran on ROCm 7.14.1 (AMD TheRock tarball for gfx1151).
 - **Check upstream before a tuning round.** We tuned Strata on our own gfx1151 bring-up while upstream shipped official
   gfx1151 support two days later (~1.4–1.8× our prompt speed).
 - **A reboot alone can move numbers ~5%**: compare before/after-reboot changes against a same-session baseline.
+- **Never compile on the box while benchmarking**: CPU and GPU share the 70 W package budget, and a build halves GPU
+  clocks. Sustained load also drifts from ~69 W to ~57 W as the chassis warms over a day, so long A/Bs must alternate runs.
+- **ROCm vs Vulkan is a per-build question, not a backend property.** For GLM-5.3-Flash, a matched run (same commit,
+  model, flags, session) gave Vulkan 29.6 vs HIP 21.5 tok/s chat and 208 vs 117 tok/s prompt at 32K. The community's
+  "ROCm 1.7× faster" result compared against an untuned Vulkan path. Measure your own build before switching.
 - **Batching does not pay here**: with prompt-heavy agent turns at 70 W and speculation already making single-stream
   decode efficient, serving several requests at once only delays the first answers.
 
