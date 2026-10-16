@@ -1,0 +1,61 @@
+From adba1b90a6227754efeb19345c1794e49d7925cd Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 09:30:37 +0000
+Subject: [PATCH 11/15] vulkan: GDN_CACHE fusion also for qwen35 layer 0
+ (graph_optimize grouping)
+
+In the first linear-attention layer the CPY destination (a view of the cache) and the z gate sit between the
+GATED_DELTA_NET and its snapshot CPY. graph_optimize scheduled the view early and then refused to group the
+GDN with its CPY. The group now holds the GDN, its unscheduled views and the CPY; already scheduled views and nodes
+that do not read the GDN are left out. 48/48 qwen35 GDN layers fuse in the MTP verify graph (was 47/48).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 24 ++++++++++++------------
+ 1 file changed, 12 insertions(+), 12 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index af72ed899..fb2c88df3 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -15039,8 +15039,10 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph,
+         const int dist = ggml_vk_gdn_cache_pattern(nullptr, graph, g, true);
+         for (int j = g + 1; dist > 0 && j < g + dist; ++j) {
+             const ggml_tensor * v = graph->nodes[j];
+-            if (used[j]) {
+-                return 0;
++            if (!is_empty(v) || used[j]) {
++                // a node that does not read the GDN (see ggml_vk_gdn_cache_pattern) is scheduled on its own later;
++                // an already scheduled view (e.g. the CPY destination, a view of the cache) costs nothing
++                continue;
+             }
+             for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                 const ggml_tensor * src = v->src[s];
+@@ -15170,16 +15172,14 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph,
+         {
+             const int dist = gdn_cpy_dist(first_unused);
+             if (dist > 0) {
+-                // the GDN, the views in between and the CPY first (the fusion needs only empty nodes between
+-                // them), then the other unscheduled nodes in between (they do not depend on the CPY)
+-                for (int pass = 0; pass < 2; ++pass) {
+-                    for (int j = first_unused; j <= first_unused + dist; ++j) {
+-                        const bool head = j == first_unused || j == first_unused + dist || is_empty(graph->nodes[j]);
+-                        if (!used[j] && head == (pass == 0)) {
+-                            new_order.push_back(graph->nodes[j]);
+-                            used_node_set.insert(graph->nodes[j]);
+-                            used[j] = true;
+-                        }
++                // the GDN, the views in between and the CPY (the fusion needs only empty nodes between them); other
++                // nodes in between do not read the GDN and are scheduled on their own later
++                for (int j = first_unused; j <= first_unused + dist; ++j) {
++                    const bool part = j == first_unused || j == first_unused + dist || is_empty(graph->nodes[j]);
++                    if (!used[j] && part) {
++                        new_order.push_back(graph->nodes[j]);
++                        used_node_set.insert(graph->nodes[j]);
++                        used[j] = true;
+                     }
+                 }
+                 while (first_unused < graph->n_nodes && used[first_unused]) {
+-- 
+2.43.0
+

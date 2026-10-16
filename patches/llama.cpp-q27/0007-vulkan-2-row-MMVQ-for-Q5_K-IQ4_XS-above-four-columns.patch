@@ -1,0 +1,213 @@
+From 721ad52010b903b2cbf230065d4020ca708bc5df Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 02:58:46 +0000
+Subject: [PATCH 07/15] vulkan: 2-row MMVQ for Q5_K / IQ4_XS above four columns
+ on RDNA3/4; Qwen3.8-27B verify-shape tests
+
+- Q5_K and IQ4_XS integer-dot matvec use 2 rows per workgroup from 5 columns on (other types keep 4).
+  Cold weights, Radeon 8060S (gfx1151), n=5: q5_K m=17408 k=5120 351 -> 334 us, iq4_xs 286 -> 272 us,
+  q5_K m=6144 k=5120 143 -> 135 us. Qwen3.8-27B MTP + 64K draft vocabulary, same session: n4 chat
+  31.1 -> 31.6, code 36.0 -> 36.6, 32K 25.9 -> 26.3; n5 code 37.2 -> 38.0 tok/s. Greedy outputs are
+  identical with and without.
+- GGML_VK_DMMV_LARGE_MAX_M / _MIN_K / _FORCE: experiment knobs for the AMD large-workgroup matvec (the GLM
+  series 0018 rule with 1024 / 8192), off by default: the large workgroup reduces in a different order,
+  and it gave nothing at these shapes.
+- test-backend-ops: test_mul_mat_cold with Qwen3.8-27B decode/verify shapes at n=1..8 (eval) and
+  cold-weight perf variants (nw distinct weights beyond the 32 MiB MALL; us/run / nw per matvec).
+
+Tried, not kept: an A-load-once multi-column MMVQ path for Q4_K / Q5_K / IQ4_XS (no gain; the compiler
+already shares the A loads across columns).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan-types.h |  3 +
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp     | 24 ++++++-
+ tests/test-backend-ops.cpp               | 89 ++++++++++++++++++++++++
+ 3 files changed, 114 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index 7794c6310..136d11e19 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -1004,6 +1004,9 @@ struct vk_device_struct {
+     ggml_backend_buffer_type buffer_type;
+ 
+     bool disable_fusion;
++    uint32_t dmmv_large_max_m;  // AMD: large workgroup (4 subgroups) for matvecs with m <= this (and k >= 1024)
++    uint32_t dmmv_large_min_k;  // AMD: ... or m <= 4096 and k >= this (n <= 3)
++    bool     dmmv_large_force;  // experiment: large workgroup for every matvec
+     bool disable_descriptor_reuse;
+     std::atomic<uint64_t> buffer_destroy_count {};
+     bool disable_host_visible_vidmem;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 8357f01fe..71d210efe 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -2879,6 +2879,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     // RDNA3/4: above four columns, static 4 rows for all types bench faster than the default
+     const bool is_rdna3_or_4 = device->vendor_id == VK_VENDOR_ID_AMD && (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
+     auto const &rm_int_n = [&](uint32_t rows, uint32_t i) { return (is_rdna3_or_4 && i >= 4) ? 4u : rows; };
++    // Q5_K and IQ4_XS: 2 rows above four columns. Cold weights on Radeon 8060S (gfx1151), Qwen3.8-27B MTP verify
++    // shapes at n=5: q5_K m=17408 k=5120 351 -> 334 us, iq4_xs 286 -> 272 us, q5_K m=6144 k=5120 143 -> 135 us
++    auto const &rm_int_n2 = [&](uint32_t rows, uint32_t i) { return (is_rdna3_or_4 && i >= 4) ? 2u : rows; };
+     // RDNA3/4 and NVIDIA except pre-Turing: use 4 rows for MUL_MAT_ID MMVQ.
+     auto const &rm_id = [&](uint32_t rows) {
+         if (device->vendor_id == VK_VENDOR_ID_NVIDIA &&
+@@ -3001,12 +3004,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_q8_1_f32", arr_dmmv_q2_k_q8_1_f32_len[reduc], arr_dmmv_q2_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(2*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(2*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_q8_1_f32", arr_dmmv_q3_k_q8_1_f32_len[reduc], arr_dmmv_q3_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_q8_1_f32", arr_dmmv_q4_k_q8_1_f32_len[reduc], arr_dmmv_q4_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_q8_1_f32", arr_dmmv_q5_k_q8_1_f32_len[reduc], arr_dmmv_q5_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
++                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_q8_1_f32", arr_dmmv_q5_k_q8_1_f32_len[reduc], arr_dmmv_q5_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n2(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n2(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q6_K][i], "mul_mat_vec_q6_k_q8_1_f32", arr_dmmv_q6_k_q8_1_f32_len[reduc], arr_dmmv_q6_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+ 
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_S][i], "mul_mat_vec_iq1_s_q8_1_f32", arr_dmmv_iq1_s_q8_1_f32_len[reduc], arr_dmmv_iq1_s_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_M][i], "mul_mat_vec_iq1_m_q8_1_f32", arr_dmmv_iq1_m_q8_1_f32_len[reduc], arr_dmmv_iq1_m_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ4_XS][i], "mul_mat_vec_iq4_xs_q8_1_f32", arr_dmmv_iq4_xs_q8_1_f32_len[reduc], arr_dmmv_iq4_xs_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
++                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ4_XS][i], "mul_mat_vec_iq4_xs_q8_1_f32", arr_dmmv_iq4_xs_q8_1_f32_len[reduc], arr_dmmv_iq4_xs_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n2(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n2(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+ 
+             }
+ #endif // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
+@@ -4904,6 +4907,10 @@ vk_device ggml_vk_get_device(size_t idx) {
+         device->serialize_submissions = getenv("GGML_VK_SERIALIZE_SUBMISSIONS") != nullptr;
+ 
+         device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
++        // experiment knobs for the AMD mul_mat_vec workgroup size (ggml_vk_get_dequantize_mul_mat_vec), default off
++        device->dmmv_large_max_m = getenv("GGML_VK_DMMV_LARGE_MAX_M") ? (uint32_t) std::stoul(getenv("GGML_VK_DMMV_LARGE_MAX_M")) : 0;
++        device->dmmv_large_min_k = getenv("GGML_VK_DMMV_LARGE_MIN_K") ? (uint32_t) std::stoul(getenv("GGML_VK_DMMV_LARGE_MIN_K")) : UINT32_MAX;
++        device->dmmv_large_force = getenv("GGML_VK_DMMV_LARGE_FORCE") != nullptr;
+ 
+         device->disable_descriptor_reuse = getenv("GGML_VK_DISABLE_DESCRIPTOR_REUSE") != nullptr;
+ 
+@@ -5609,6 +5616,19 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+         }
+     }
+ 
++    // AMD (experiment knobs, off by default; GLM series patch 0018 rule with GGML_VK_DMMV_LARGE_MAX_M=1024
++    // GGML_VK_DMMV_LARGE_MIN_K=8192): four subgroups per row for few-row or long-row matrices. The large
++    // workgroup reduces in a different order, so it changes results in the last bits.
++    if (ctx->device->vendor_id == VK_VENDOR_ID_AMD) {
++        const bool few_rows  = m <= ctx->device->dmmv_large_max_m && k >= 1024 &&
++                               !(a_type == GGML_TYPE_F32 && num_cols == 1) &&
++                               !(ggml_is_quantized(a_type) && num_cols > 1 && m >= 64);
++        const bool long_rows = m <= 4096 && k >= ctx->device->dmmv_large_min_k && num_cols <= 3;
++        if (few_rows || long_rows || ctx->device->dmmv_large_force) {
++            dmmv_wg = DMMV_WG_SIZE_LARGE;
++        }
++    }
++
+     if (b_type == GGML_TYPE_Q8_1) {
+         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 0d7a7ed81..daa4ac42d 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9621,8 +9621,95 @@ static const ggml_type other_types[] = {
+ #endif
+ 
+ // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
++// Matvec at decode / speculative-verify shapes with optional cold weights: nw > 1 builds nw distinct weights and
++// inputs and sums the products, so the weights exceed the GPU's last-level cache (32 MiB MALL on Strix Halo) and
++// every run reads them from memory. Per-matvec time: perf mode us/run / nw (or GGML_VK_PERF_LOGGER per op).
++struct test_mul_mat_cold : public test_case {
++    const ggml_type type_a;
++    const int64_t m;
++    const int64_t n;
++    const int64_t k;
++    const int64_t nw;
++
++    std::string vars() override {
++        return VARS_TO_STR5(type_a, m, n, k, nw);
++    }
++
++    double max_nmse_err() override { return 5e-4; }
++
++    uint64_t op_flops(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        // cold variant: a flop count above the perf target, so the graph runs once per timing run and
++        // us/run is the time of the nw matvecs (+ nw-1 small adds); the printed FLOPS are not meaningful
++        return nw > 1 ? 1000ULL * 1000 * 1000 * 1000 : 2 * m * n * k;
++    }
++
++    test_mul_mat_cold(ggml_type type_a = GGML_TYPE_Q4_K, int64_t m = 4096, int64_t n = 1, int64_t k = 4096, int64_t nw = 1)
++        : type_a(type_a), m(m), n(n), k(k), nw(nw) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * out = nullptr;
++        for (int64_t i = 0; i < nw; ++i) {
++            ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
++            ggml_set_name(a, "a");
++            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
++            ggml_set_name(b, "b");
++            ggml_tensor * mm = ggml_mul_mat(ctx, a, b);
++            out = out ? ggml_add(ctx, out, mm) : mm;
++        }
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return ggml_op_name(GGML_OP_MUL_MAT);
++    }
++};
++
++// Qwen3.8-27B (qwen35 dense) weight shapes, n = 1 (decode) .. 8 (MTP verify of up to 7 drafts)
++static void add_q27_verify_mul_mat_cases(std::vector<std::unique_ptr<test_case>> & test_cases, bool perf) {
++    struct shape { ggml_type t; int64_t m, k; };
++    const std::vector<shape> shapes = {
++        { GGML_TYPE_Q5_K,   17408,  5120 }, // ffn_up / ffn_gate
++        { GGML_TYPE_IQ4_XS, 17408,  5120 },
++        { GGML_TYPE_Q4_K,   17408,  5120 },
++        { GGML_TYPE_Q5_K,    5120, 17408 }, // ffn_down
++        { GGML_TYPE_IQ4_XS,  5120, 17408 },
++        { GGML_TYPE_Q6_K,    5120, 17408 },
++        { GGML_TYPE_Q5_K,    5120,  6144 }, // ssm_out / attn_output
++        { GGML_TYPE_Q6_K,    5120,  6144 },
++        { GGML_TYPE_Q8_0,    5120,  6144 },
++        { GGML_TYPE_Q5_K,    6144,  5120 }, // attn_gate (GDN z)
++        { GGML_TYPE_Q5_K,   10240,  5120 }, // attn_qkv (GDN)
++        { GGML_TYPE_Q4_K,   10240,  5120 },
++        { GGML_TYPE_Q8_0,      48,  5120 }, // ssm_alpha / ssm_beta
++        { GGML_TYPE_Q6_K,  248320,  5120 }, // output head
++        { GGML_TYPE_Q3_K,  248320,  5120 }, // MTP draft head
++        { GGML_TYPE_Q3_K,   32768,  5120 }, // MTP draft-vocabulary head
++    };
++    for (const auto & s : shapes) {
++        const int64_t bytes = (int64_t) ggml_row_size(s.t, s.k) * s.m;
++        if (!perf) {
++            if (s.m * s.k > 17408 * 5120) {
++                continue;
++            }
++            for (int64_t n : {1, 2, 3, 5, 8}) {
++                test_cases.emplace_back(new test_mul_mat_cold(s.t, s.m, n, s.k, 1));
++            }
++            continue;
++        }
++        const int64_t nw = std::min<int64_t>(16, std::max<int64_t>(1, (160ll*1024*1024 + bytes - 1) / bytes));
++        for (int64_t n = 1; n <= 8; ++n) {
++            test_cases.emplace_back(new test_mul_mat_cold(s.t, s.m, n, s.k, nw));
++        }
++    }
++}
++
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
++
++    add_q27_verify_mul_mat_cases(test_cases, false);
+     std::default_random_engine rng(0);
+ 
+     // unary ops
+@@ -12017,6 +12104,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    add_q27_verify_mul_mat_cases(test_cases, true);
++
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
+-- 
+2.43.0
+

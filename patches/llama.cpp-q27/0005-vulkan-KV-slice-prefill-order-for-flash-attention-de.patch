@@ -1,0 +1,230 @@
+From 203d0fb1ca99e1a89f0d237cefd62e4b2b2e2402 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 21:19:52 +0000
+Subject: [PATCH 05/15] vulkan: KV-slice prefill order for flash attention
+ (default on AMD RDNA)
+
+Long-KV prefill flash attention on gfx1151 ran at under 1 TFLOPS on the
+KV cache layout: every workgroup streamed the whole K/V range on its own,
+and since llama's cache interleaves the heads per token (Qwen3.8-27B: 4 KV
+heads x 256 x f16 = 2 KiB token stride) each workgroup also read only a
+quarter of every token row. Qwen3.8-27B pp1024 at depth 32K spent 82% of
+the ubatch in FLASH_ATTN_EXT (16 x 982 ms).
+
+Reorder the workgroups (row tiles x query heads x split_k, flattened):
+- SPLIT_OUTER_BIT: run all row tiles and query heads of a KV head on one KV
+  slice (split_k) before the next, so concurrent workgroups share a
+  cache-sized slice of K/V (ported from our Laguna patch, now also grouping
+  the query heads of a KV head).
+- KV_HEAD_INNER_BIT: make the KV head the fastest index, so concurrent
+  workgroups read whole token rows of the head-interleaved cache.
+GGML_VK_FA_KV_SLICE=<tokens> (default 2048 on AMD RDNA, 0 = off),
+GGML_VK_FA_KV_HEAD_INNER=0|1 (default 1 on AMD RDNA),
+GGML_VK_FA_KV_SLICE_MAX_MB (split_k scratch cap, default 512; slices widen).
+Applies to prefill (N > 8) without GQA folding, sparse or coopmat2.
+
+FLASH_ATTN_EXT op level, gfx1151 RADV, 24/4 heads, head dim 256, 1024 rows,
+f16 KV in cache layout: KV 2K 8.25 -> 5.74 ms, 32K 1026 -> 93 ms,
+60K 2239 -> 164 ms (0.7 -> 9.4 TFLOPS). Contiguous per-head K/V: neutral.
+Model, pp1024 @ d32768: 53 -> 158 tok/s (with the concat fix).
+
+The split_k partials change the summation order of the softmax, so output
+is not bit-identical; KLD vs the Q8_0 reference unchanged (see the report).
+
+test-backend-ops: Qwen3.8-27B-shaped eval cases (8K/8000 KV, ragged rows,
+sinks, q8_0, cache layout) and perf cases (2K/32K/60K, both layouts).
+FLASH_ATTN_EXT 5329/5329 with the defaults.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 48 +++++++++++++++++++
+ .../vulkan-shaders/flash_attn_base.glsl       | 40 +++++++++++++++-
+ tests/test-backend-ops.cpp                    | 21 ++++++++
+ 3 files changed, 107 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index be7ce3883..90ac3641b 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -8265,6 +8265,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+ 
+     uint32_t split_kv = KV;
+     uint32_t split_k = 1;
++    bool fa_split_outer = false;
++    bool fa_kv_head_inner = false;
+ 
+     // Intel Alchemist prefers more workgroups
+     const uint32_t shader_core_count_multiplier = (ctx->device->vendor_id == VK_VENDOR_ID_INTEL && ctx->device->architecture != INTEL_XE2) ? 2 : 1;
+@@ -8298,6 +8300,46 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+         if (total_wgs_no_split < shader_core_count * 2) {
+             split_k = shader_core_count * 2 / total_wgs_no_split;
+         }
++        // KV-slice prefill order (see SPLIT_OUTER_BIT / KV_HEAD_INNER_BIT in flash_attn_base.glsl). Without it every
++        // workgroup streams the whole K/V range on its own; with long KV that thrashes the caches, and on a KV cache
++        // that interleaves the heads per token (llama's layout: 4 heads x 256 x f16 = 2 KiB token stride) each
++        // workgroup also reads only a quarter of every token row. gfx1151, Qwen3.8-27B shapes (24/4 heads, head dim
++        // 256, 1024 rows, KV cache layout): 997 -> 89 ms at KV 32K, 2270 -> 169 ms at KV 60K, 7.9 -> 5.4 ms at 2K.
++        // - GGML_VK_FA_KV_SLICE=<tokens>: cut KV into slices (split_k) and run all row tiles and query heads on one
++        //   slice before the next, so concurrent workgroups share a cache-sized part of K/V. 0 = off.
++        // - GGML_VK_FA_KV_HEAD_INNER=0|1: KV head is the fastest part of the order, so concurrent workgroups read
++        //   whole token rows.
++        // - GGML_VK_FA_KV_SLICE_MAX_MB: cap on the split_k scratch (O / m / L partials per slice), default 512;
++        //   the slices widen to stay under it.
++        // Default on for AMD RDNA (tuned on RDNA3.5), off elsewhere.
++        const bool kv_order_default = ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->architecture != AMD_GCN;
++        static const int kv_slice_env = [] {
++            const char * e = getenv("GGML_VK_FA_KV_SLICE");
++            return e ? std::max(0, atoi(e)) : -1;
++        }();
++        static const int kv_head_inner_env = [] {
++            const char * e = getenv("GGML_VK_FA_KV_HEAD_INNER");
++            return e ? (atoi(e) != 0 ? 1 : 0) : -1;
++        }();
++        static const uint64_t kv_slice_max_bytes = [] {
++            const char * e = getenv("GGML_VK_FA_KV_SLICE_MAX_MB");
++            return (uint64_t) (e ? std::max(1, atoi(e)) : 512) << 20;
++        }();
++        const uint32_t kv_slice = kv_slice_env >= 0 ? (uint32_t) kv_slice_env : (kv_order_default ? 2048u : 0u);
++        const bool kv_head_inner = kv_head_inner_env >= 0 ? kv_head_inner_env == 1 : kv_order_default;
++        const bool reorder_ok = N > 8 && !use_sparse && neq3 == 1 && nek3 == 1 && nek2 == nev2 && neq2 % nek2 == 0 &&
++                                tuning_params.path != FA_COOPMAT2;
++        if (reorder_ok && kv_slice > 0 && KV >= 2 * kv_slice) {
++            const uint64_t per_split = ((uint64_t)HSV * ne1 * sizeof(float) + ne1 * sizeof(float) * 2) * ne2 * ne3;
++            const uint64_t max_bytes = std::min<uint64_t>(kv_slice_max_bytes, ctx->device->properties.limits.maxStorageBufferRange);
++            const uint32_t max_split = (uint32_t) std::max<uint64_t>(1, max_bytes / per_split);
++            split_k = std::max(split_k, std::min(CEIL_DIV(KV, kv_slice), max_split));
++            fa_split_outer = true;
++        }
++        if (reorder_ok && kv_head_inner) {
++            fa_split_outer = true;
++            fa_kv_head_inner = true;
++        }
+     }
+ 
+     if (!use_sparse && split_k > 1) {
+@@ -8450,6 +8492,12 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+     }
+ 
+     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
++    if (fa_split_outer) {
++        mask_n_head_log2 |= 1u << 25; // SPLIT_OUTER_BIT, see flash_attn_base.glsl
++        if (fa_kv_head_inner) {
++            mask_n_head_log2 |= 1u << 26; // KV_HEAD_INNER_BIT
++        }
++    }
+ 
+     if (use_mask_opt)
+     {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl
+index 2e0e23bc1..066d661aa 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl
+@@ -75,6 +75,14 @@ layout (push_constant) uniform parameter {
+ } p;
+ 
+ #define SINK_ENABLE_BIT (1<<24)
++// KV-slice prefill order (gqa_ratio == 1, ne3 == 1): the flattened workgroup id runs, from fastest to slowest, over
++// row tiles, the query heads of one KV head, the KV slices (split_k), and the KV heads, so concurrently running
++// workgroups share one cache-sized slice of K/V.
++#define SPLIT_OUTER_BIT (1<<25)
++// With SPLIT_OUTER_BIT: the KV head is the fastest part of the order (KV heads, row tiles, query heads of one KV
++// head, KV slices), so concurrent workgroups read all heads of the same tokens. For a KV cache that interleaves
++// the heads per token this reads whole token rows instead of one head's part of each row.
++#define KV_HEAD_INNER_BIT (1<<26)
+ #define N_LOG2_MASK 0xFFFF
+ 
+ layout (binding = 4) readonly buffer S {float data_s[];};
+@@ -148,14 +156,39 @@ ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC
+ 
+ uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
+          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
+-         q_stride, k_stride, v_stride, m_stride, sparse_base;
++         q_stride, k_stride, v_stride, m_stride, sparse_base, split_outer_iq2;
+ 
+ void init_indices()
+ {
+     N = p.N;
+     KV = p.KV;
+ 
+-    if (p.k_num > 1) {
++    if ((p.mask_n_head_log2 & SPLIT_OUTER_BIT) != 0) {
++        // KV-slice order, see SPLIT_OUTER_BIT. Dispatch is (row tiles * k_num, neq2, neq3).
++        gqa_iq1 = 0;
++        const uint32_t n_row_tiles = CEIL_DIV(p.N, Br);
++        const uint32_t heads_per_kv = p.neq2 / p.nek2;
++        uint32_t lin = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
++        uint32_t kv_head;
++        if ((p.mask_n_head_log2 & KV_HEAD_INNER_BIT) != 0) {
++            kv_head = lin % p.nek2;
++            lin /= p.nek2;
++            i = lin % n_row_tiles;
++            lin /= n_row_tiles;
++        } else {
++            i = lin % n_row_tiles;
++            lin /= n_row_tiles;
++        }
++        const uint32_t q_sub = lin % heads_per_kv;
++        lin /= heads_per_kv;
++        if ((p.mask_n_head_log2 & KV_HEAD_INNER_BIT) != 0) {
++            split_k_index = lin;
++        } else {
++            split_k_index = lin % p.k_num;
++            kv_head = lin / p.k_num;
++        }
++        split_outer_iq2 = kv_head * heads_per_kv + q_sub;
++    } else if (p.k_num > 1) {
+         if (p.gqa_ratio > 1) {
+             i = 0;
+             // batch and split_k share gl_WorkGroupID.x
+@@ -184,6 +217,9 @@ void init_indices()
+     // When not using grouped query attention, all rows share the same iq2, equal to gl_WorkGroupID.y.
+     // When using grouped query attention, each workgroup does gqa_ratio consecutive values of iq2.
+     iq2 = gl_WorkGroupID.y * p.gqa_ratio;
++    if ((p.mask_n_head_log2 & SPLIT_OUTER_BIT) != 0) {
++        iq2 = split_outer_iq2;
++    }
+     iq3 = gl_WorkGroupID.z;
+ 
+     // broadcast factors
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 944807db5..f1cb8250a 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11737,6 +11737,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+ 
++    // Qwen3.8-27B (qwen35) full-attention prefill shapes (24 query heads on 4 KV heads, head dim 256), long enough
++    // for the KV-slice prefill order (GGML_VK_FA_KV_SLICE): ragged row tiles and KV lengths, and a q8_0 cache
++    for (int kv : { 8192, 8000 }) {
++        for (int nb : { 1024, 77 }) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        }
++    }
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192, 512, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 8192, 300, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++
+     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
+     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
+     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
+@@ -12341,6 +12353,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    // Qwen3.8-27B delta-net conv state concat at -ub 1024 (conv state || transposed qkv projection)
++    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 1, 1}, 1024, 0, 16));
++
++    // Qwen3.8-27B (qwen35) full-attention prefill, -ub 1024: 24 query heads on 4 KV heads, head dim 256
++    // permute {0, 2, 1, 3} is the KV cache layout (heads interleaved per token, 2 KiB token stride)
++    for (int kv : { 2048, 32768, 61440 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
++    }
+ 
+     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
+         for (int hs : { 64, 128, 256, 512, 576, }) {
+-- 
+2.43.0
+

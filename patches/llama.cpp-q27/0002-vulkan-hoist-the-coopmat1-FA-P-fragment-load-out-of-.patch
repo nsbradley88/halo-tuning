@@ -1,0 +1,65 @@
+From ab7dbf0e13acd18789a922bafe79d254146b29fd Mon Sep 17 00:00:00 2001
+From: Nathan Wilson <nath.flagman151@passmail.com>
+Date: Thu, 30 Jul 2026 01:21:49 +0000
+Subject: [PATCH 02/15] vulkan: hoist the coopmat1 FA P-fragment load out of
+ the hsv_tile loop
+
+The GEMM2 P load depends only on bc_chunk, but sat inside the hsv_tile
+loop, so all four fragments were re-read from shared memory once per
+tile (2 tiles at HSV=128, 4 at HSV=256).
+
+Load them once into a coopmat array before the loop. Psh is not written
+again until the next KV block, so the fragments stay valid across the
+barriers inside it.
+
+Measured on gfx1151 (RADV), Qwen3-Coder-30B-A3B, pp2048 f16 KV:
+d8192 +6.9%, d16384 +8.1%, d32768 +9.2%. VGPRs and LDS unchanged,
+0 spilled. FLASH_ATTN_EXT suite 5105/5105.
+
+Assisted-by: Claude Fable 5
+(cherry picked from commit e11cafa02f96b009c3088f9f601edc13e75524ab)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp    | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
+index aa9dd624b..f031a27d2 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
+@@ -438,6 +438,13 @@ void main() {
+ 
+         const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
+ 
++        // Psh is not written again until the next KV block, so the P fragments are the same
++        // for every hsv_tile. Load them once instead of re-reading LDS per tile.
++        coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> PMat[Bc / MatBc];
++        [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
++            coopMatLoad(PMat[bc_chunk], Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
++        }
++
+         // Each subgroup handles HSV/4 columns
+         [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < num_hsv_tiles; ++hsv_tile) {
+             const uint hsv_offset = (hsv_tile * row_split + gl_SubgroupID) * 16;
+@@ -492,8 +499,6 @@ void main() {
+ 
+             if (hsv_offset < HSV_pad) {
+                 [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
+-                    coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
+-
+                     if (SHMEM_STAGING == 0) {
+                     if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE) {
+                         // F16/BF16 values can be loaded directly from global memory
+@@ -509,7 +514,7 @@ void main() {
+                         coopMatLoad(QMat, kvsh, v_tile_offset, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                     }
+ 
+-                    PVMat = coopMatMulAdd(KMat, QMat, PVMat);
++                    PVMat = coopMatMulAdd(PMat[bc_chunk], QMat, PVMat);
+                 }
+ 
+                 // Store PVMat to pvsh and load into Of
+-- 
+2.43.0
+

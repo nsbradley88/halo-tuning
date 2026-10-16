@@ -1,0 +1,269 @@
+From 67f30db51daa62790bbcf78240be6927f1c6a868 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 08:23:58 +0000
+Subject: [PATCH 10/15] speculative: qwen35 MTP keeps only output rows in
+ t_h_nextn when masked; opt-in deferred MTP catch-up
+
+- qwen35 / qwen35moe MTP graph: with masked nextn embeddings, llama_context reads back the first n_outputs rows
+  of t_h_nextn, so crop to the output rows before setting it. A draft batch with non-output rows in front of the
+  draft token returned the hidden state of the first row (acceptance 0.75 -> 0.45 with the deferral below).
+- Deferred catch-up (env LLAMA_MTP_DEFER=1, single-head MTP with its own KV): the rows a small process() batch
+  decodes through the MTP layer are kept and decoded together with the first draft step, accept() drops the rows
+  of rejected drafts. Off by default: on Qwen3.8-27B MTP n4 it saves ~1.2 ms of GPU time per round (catch-up 2.2
+  ms, first draft step +1.0 ms), but the separate catch-up graph has no outputs and runs while the host verifies
+  the target logits, so wall time does not improve (44.5 vs 45.1 tok/s on one request, chat/code bench within
+  noise).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp   | 123 ++++++++++++++++++++++++++++++++++++++-
+ src/models/qwen35.cpp    |  15 +++--
+ src/models/qwen35moe.cpp |  15 +++--
+ 3 files changed, 143 insertions(+), 10 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 605c5e0a8..d7ff9cf0f 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -16,6 +16,7 @@
+ #include <cassert>
+ #include <cmath>
+ #include <cstring>
++#include <limits>
+ #include <iomanip>
+ #include <map>
+ #include <cinttypes>
+@@ -1425,6 +1426,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<int>                i_last;
+     std::vector<std::vector<float>> chain_h;
+ 
++    // Deferred catch-up (opt-in, env LLAMA_MTP_DEFER=1; single-head MTP with its own KV, e.g. qwen35): the rows a
++    // small process() batch would decode through the MTP layer to fill its KV are kept here and decoded together
++    // with the first draft step (one MTP graph per round instead of two). accept() drops the rows of rejected
++    // drafts. Rows at or after the first position of a later batch are superseded by it; the rest are decoded
++    // before it. Off by default: it saves ~1.2 ms of GPU time per round on Qwen3.8-27B, but the separate catch-up
++    // graph has no outputs and overlaps the host-side verification, so the wall time does not improve.
++    struct deferred_row {
++        llama_token id;
++        llama_pos   pos;
++    };
++    bool                                   defer_catchup = false;
++    std::vector<std::vector<deferred_row>> deferred;   // [n_seq]
++    std::vector<std::vector<float>>        deferred_h; // [n_seq][n_rows * n_embd]
++    static constexpr int32_t               defer_max_rows = 16;
++
+     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
+         , params(params.draft)
+@@ -1496,6 +1512,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+ 
++        defer_catchup = !is_mem_shared && !chain_heads && getenv("LLAMA_MTP_DEFER") != nullptr;
++        deferred.assign(n_seq, {});
++        deferred_h.assign(n_seq, {});
++
+         if (chain_heads) {
+             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
+ 
+@@ -1540,7 +1560,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+ 
+         auto * ctx_dft = this->params.ctx_dft;
+-        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
++        llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
++        if (defer_catchup && !deferred[seq_id].empty()) {
++            pos_max = std::max(pos_max, deferred[seq_id].back().pos); // decoded with the next draft step
++        }
+ 
+         if (pos_max < N - 1 && !is_mem_shared) {
+             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
+@@ -1582,8 +1605,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+ 
++        // rows deferred from an earlier call: drop those this batch supersedes, decode the rest first
++        if (defer_catchup && !flush_deferred(&batch_in)) {
++            return false;
++        }
++
++        const bool defer = defer_catchup && batch_in.has_token() && n_tokens <= defer_max_rows;
++
++        if (defer) {
++            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
++            for (int k = 0; k < n_tokens; ++k) {
++                const auto & t = batch_in.tokens[k];
++                const llama_seq_id seq_id = t.seq_id;
++                const float * h_row = k == i_batch_beg[seq_id]
++                    ? pending_h[seq_id].data()
++                    : h_tgt + (size_t) (k - 1) * n_embd;
++                deferred[seq_id].push_back({ t.id, t.pos[0] });
++                deferred_h[seq_id].insert(deferred_h[seq_id].end(), h_row, h_row + n_embd);
++            }
++        }
++
+         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
+-        if (!is_mem_shared) {
++        if (!is_mem_shared && !defer) {
+             batch.clear();
+ 
+             // pair each token with the tgt embedding shifted right by one position, and
+@@ -1664,6 +1707,62 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         return true;
+     }
+ 
++    // add the deferred catch-up rows of seq_id below pos_end to the batch (no outputs)
++    void add_deferred(llama_seq_id seq_id, llama_pos pos_end) {
++        const auto & rows = deferred[seq_id];
++        for (size_t r = 0; r < rows.size(); ++r) {
++            if (rows[r].pos >= pos_end) {
++                break;
++            }
++            const int32_t idx = batch.add(rows[r].id, rows[r].pos, seq_id, false);
++            batch.set_embd_state(idx, { deferred_h[seq_id].data() + r * n_embd, 1, (size_t) n_embd });
++        }
++    }
++
++    void clear_deferred(llama_seq_id seq_id) {
++        deferred[seq_id].clear();
++        deferred_h[seq_id].clear();
++    }
++
++    // decode the deferred rows on their own; with next, only the rows before next's first position of each seq
++    bool flush_deferred(const common_batch * next) {
++        bool any = false;
++        for (const auto & rows : deferred) {
++            any |= !rows.empty();
++        }
++        if (!any) {
++            return true;
++        }
++
++        batch.clear();
++        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++            llama_pos pos_end = std::numeric_limits<llama_pos>::max();
++            if (next) {
++                for (const auto & t : next->tokens) {
++                    if (t.seq_id == seq_id) {
++                        pos_end = t.pos[0];
++                        break;
++                    }
++                }
++            }
++            add_deferred(seq_id, pos_end);
++        }
++
++        int32_t rc = 0;
++        if (batch.size() > 0) {
++            rc = llama_process(params.ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
++        }
++        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++            clear_deferred(seq_id);
++        }
++        batch.clear();
++        if (rc != 0) {
++            SPC_ERR("llama_process(ctx_dft) deferred catch-up failed rc=%d\n", (int) rc);
++            return false;
++        }
++        return true;
++    }
++
+     void draft(common_speculative_draft_params_vec & dparams) override {
+         auto & ctx_dft = params.ctx_dft;
+ 
+@@ -1697,6 +1796,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 common_sampler_reset(smpls[seq_id].get());
+             }
+ 
++            // the deferred catch-up rows of this seq go in front of its first draft token (seqs that do not
++            // draft keep theirs for the next process() call)
++            if (defer_catchup) {
++                add_deferred(seq_id, dp.pos0);
++            }
++
+             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
+             batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+ 
+@@ -1727,6 +1832,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             }
+ 
+             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
++            if (i == 0 && defer_catchup) {
++                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                    if (drafting[seq_id]) {
++                        clear_deferred(seq_id);
++                    }
++                }
++            }
+             if (ret != 0) {
+                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
+                 break;
+@@ -1843,6 +1955,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
++
++        // deferred catch-up rows of the verify batch: keep the sampled token and the accepted drafts
++        if (defer_catchup && (int32_t) deferred[seq_id].size() >= n_rows) {
++            const size_t keep = deferred[seq_id].size() - (size_t) (n_rows - 1 - i_h);
++            deferred[seq_id].resize(keep);
++            deferred_h[seq_id].resize(keep * n_embd);
++        }
+     }
+ };
+ 
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 13281989a..bc86bfc52 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -680,10 +680,17 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     GGML_ASSERT(head_norm_w && "QWEN35 MTP: missing both nextn.shared_head_norm and output_norm");
+     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+ 
+-    cb(cur, "h_nextn", -1);
+-    res->t_h_nextn = cur;
+-
+-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++    // masked nextn embeddings are read back as the first n_outputs rows of t_h_nextn: crop to the output rows
++    // first (a draft step may carry non-output catch-up rows in front of its draft token)
++    if (cparams.embeddings_nextn_masked) {
++        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++        cb(cur, "h_nextn", -1);
++        res->t_h_nextn = cur;
++    } else {
++        cb(cur, "h_nextn", -1);
++        res->t_h_nextn = cur;
++        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++    }
+     cb(cur, "mtp_shared_head_norm", -1);
+ 
+     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index b2979b05c..2a3ce4535 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -753,10 +753,17 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
+     GGML_ASSERT(head_norm_w && "QWEN35MOE MTP: missing both nextn.shared_head_norm and output_norm");
+     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+ 
+-    cb(cur, "h_nextn", -1);
+-    res->t_h_nextn= cur;
+-
+-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++    // masked nextn embeddings are read back as the first n_outputs rows of t_h_nextn: crop to the output rows
++    // first (a draft step may carry non-output catch-up rows in front of its draft token)
++    if (cparams.embeddings_nextn_masked) {
++        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++        cb(cur, "h_nextn", -1);
++        res->t_h_nextn = cur;
++    } else {
++        cb(cur, "h_nextn", -1);
++        res->t_h_nextn = cur;
++        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++    }
+     cb(cur, "mtp_shared_head_norm", -1);
+ 
+     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+-- 
+2.43.0
+

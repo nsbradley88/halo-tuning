@@ -1,0 +1,983 @@
+From 84540a577c12535d1109f14e58bca4fc2db4b2ae Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 08:23:35 +0000
+Subject: [PATCH 08/15] GDN: read the qwen35 SSM state from the cache by ids;
+ Vulkan writes the rollback snapshots straight into the cache
+
+Port of the GLM series patch 0009 to qwen35 / qwen35moe (MTP rollback snapshots, n_rs_seq > 0):
+- ggml_gated_delta_net_ids(q, k, v, g, beta, states, ids, K): the initial state of seq s is row ids[s] of states
+  (src[6]). CPU reference; Vulkan binds ids; other backends report it unsupported.
+- qwen35 / qwen35moe: one seq, one cell, no state to clear, snapshots kept and a device that supports the op: read
+  the SSM state straight from its cache row through s_copy instead of the 3 MiB build_rs gather per layer
+  (env LLAMA_GDN_NO_STATE_IDS=1 turns it off).
+- Vulkan: fuse GATED_DELTA_NET -> views -> CPY of its snapshots into the recurrent cache (GDN_CACHE): the shader
+  writes the snapshots to the cache rows directly and the CPY is skipped. graph_optimize keeps GDN + views + CPY
+  adjacent and moves independent nodes in between (qwen35 layer 0: the z gate) behind the CPY.
+- Unused ids binding gets the (read-only) state buffer: binding the written dst there made n_seqs = 2 tests flaky.
+- test-backend-ops: GATED_DELTA_NET_IDS_CACHE (cache layout with K rollback planes, ids into each plane, in-place
+  snapshot write), plus qwen35 shapes (48 heads of 128, scalar gate, K = 5).
+
+Qwen3.8-27B UD-IQ4_XS MTP n4 verify (5 tokens), perf logger: GDN snapshot CPY 3.2 -> 0.8 ms (the rest are conv-state
+copies), state GET_ROWS 1.1 -> 0.2 ms, and the matvecs after the GDN no longer pay the snapshot writeback:
+5120x6144 (ssm_out / attn_output) at n=5 157 -> 100 us (iq4_xs), 179 -> 133 (q5_K), 166 -> 104 (q4_K).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/include/ggml.h                           |  14 ++
+ ggml/src/ggml-cpu/ops.cpp                     |   9 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu               |   2 +-
+ ggml/src/ggml-et/ggml-et.cpp                  |   3 +-
+ ggml/src/ggml-hexagon/ggml-hexagon.cpp        |   2 +-
+ ggml/src/ggml-metal/ggml-metal-device.m       |   2 +-
+ ggml/src/ggml-opencl/ggml-opencl.cpp          |   2 +-
+ ggml/src/ggml-sycl/ggml-sycl.cpp              |   1 +
+ ggml/src/ggml-vulkan/ggml-vulkan-common.h     |   2 +-
+ ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp    |   6 +-
+ .../ggml-vulkan/ggml-vulkan-push-constants.h  |   7 +
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 183 +++++++++++++++++-
+ .../vulkan-shaders/gated_delta_net.comp       |  38 +++-
+ ggml/src/ggml-webgpu/ggml-webgpu.cpp          |   3 +-
+ ggml/src/ggml.c                               |  47 +++++
+ src/models/delta-net-base.cpp                 |  14 +-
+ src/models/models.h                           |   3 +-
+ src/models/qwen35.cpp                         |  38 +++-
+ src/models/qwen35moe.cpp                      |  38 +++-
+ tests/test-backend-ops.cpp                    | 109 +++++++++++
+ 20 files changed, 483 insertions(+), 40 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index c37ba9471..bad9d672f 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2665,6 +2665,20 @@ extern "C" {
+             struct ggml_tensor  * state,
+             int64_t               K);
+ 
++    // same, but the initial state of seq s is row ids[s] of states (read in place, e.g. from a recurrent cache):
++    //   states : [S_v*S_v*H, n_rows] (contiguous rows)
++    //   ids    : I32 [n_seqs]
++    GGML_API struct ggml_tensor * ggml_gated_delta_net_ids(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * k,
++            struct ggml_tensor  * v,
++            struct ggml_tensor  * g,
++            struct ggml_tensor  * beta,
++            struct ggml_tensor  * states,
++            struct ggml_tensor  * ids,
++            int64_t               K);
++
+     // DSA lightning indexer
+     //
+     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index c7e7c47a7..f07f51091 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11132,6 +11132,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+     ggml_tensor * src_g     = dst->src[3];
+     ggml_tensor * src_beta  = dst->src[4];
+     ggml_tensor * src_state = dst->src[5];
++    ggml_tensor * src_ids   = dst->src[6]; // optional: the state of seq s is row ids[s] of src_state
+ 
+     const int64_t S_v      = src_v->ne[0];
+     const int64_t H        = src_v->ne[1];
+@@ -11143,7 +11144,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
+     GGML_ASSERT(ggml_is_contiguous(src_g));
+     GGML_ASSERT(ggml_is_contiguous(src_beta));
+-    GGML_ASSERT(ggml_is_contiguous(src_state));
++    GGML_ASSERT(src_ids ? ggml_is_contiguous_rows(src_state) : ggml_is_contiguous(src_state));
+ 
+     GGML_ASSERT(src_g->ne[0] == 1 || src_g->ne[0] == S_v);
+     GGML_ASSERT(src_beta->ne[0] == 1);
+@@ -11164,7 +11165,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+     const int64_t K = ggml_get_op_params_i32(dst, 0);
+     GGML_ASSERT(K >= 1);
+     // per-seq stride in floats (seq s starts at state + s * seq_stride)
+-    const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
++    // with ids, the row stride of the states tensor
++    const int64_t state_seq_stride = (src_ids ? src_state->nb[1] : src_state->nb[3]) / sizeof(float);
+ 
+     const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+     const int ith = params->ith;
+@@ -11210,7 +11212,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+ 
+         // copy input state into the working buffer and operate in-place
+         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
+-        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
++        const int64_t i_state = src_ids ? (int64_t) ((const int32_t *) src_ids->data)[iv3] : iv3;
++        const float * s_in = state_in_base + i_state * state_seq_stride + iv1 * S_v * S_v;
+         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+ 
+         // attn output pointer for first token of this (head, seq)
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 9fe618f85..4991d6ef4 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5853,7 +5853,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_RWKV_WKV7:
+             return true;
+         case GGML_OP_GATED_DELTA_NET:
+-            return true;
++            return op->src[6] == nullptr; // no state ids (ggml_gated_delta_net_ids)
+         case GGML_OP_DSV4_HC_COMB:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+diff --git a/ggml/src/ggml-et/ggml-et.cpp b/ggml/src/ggml-et/ggml-et.cpp
+index 54a6d166d..7de99110f 100644
+--- a/ggml/src/ggml-et/ggml-et.cpp
++++ b/ggml/src/ggml-et/ggml-et.cpp
+@@ -1519,7 +1519,8 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
+             // F32, S_v must be multiple of 8 for vectorization
+             // q, k, v may be row-contiguous with strided higher dimensions.
+             // g, beta, state stay contiguous.
+-            if (op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&  // q
++            if (op->src[6] == nullptr &&
++                op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&  // q
+                 op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&                               // k
+                 op->src[2] && op->src[2]->type == GGML_TYPE_F32 &&                               // v
+                 op->src[3] && op->src[3]->type == GGML_TYPE_F32 &&                               // g
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 08c15ff78..278151150 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -9545,7 +9545,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
+             break;
+ 
+         case GGML_OP_GATED_DELTA_NET:
+-            supp = ggml_hexagon_supported_gated_delta_net(sess, op);
++            supp = op->src[6] == nullptr && ggml_hexagon_supported_gated_delta_net(sess, op);
+             break;
+ 
+         case GGML_OP_CUMSUM:
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 13aecbdd3..cab97f7f3 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1841,7 +1841,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+         case GGML_OP_RWKV_WKV7:
+             return true;
+         case GGML_OP_GATED_DELTA_NET:
+-            return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
++            return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0 && op->src[6] == nullptr;
+         case GGML_OP_SOLVE_TRI:
+             return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_MUL_MAT:
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 52c38c36b..2e8bb51e5 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -9241,7 +9241,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+         case GGML_OP_GATED_DELTA_NET:
+             {
+                 // Match the Vulkan backend: only F32 -> F32, S_v in {16, 32, 64, 128}.
+-                if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
++                if (op->src[6] != nullptr || op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+                     return false;
+                 }
+                 const int64_t S_v = op->src[2]->ne[0];
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 6759af0ed..38053bae5 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -7149,6 +7149,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+         case GGML_OP_RWKV_WKV7:
+         case GGML_OP_GATED_LINEAR_ATTN:
+         case GGML_OP_GATED_DELTA_NET:
++            return op->src[6] == nullptr; // no state ids (ggml_gated_delta_net_ids)
+         case GGML_OP_OPT_STEP_ADAMW:
+         case GGML_OP_OPT_STEP_SGD:
+             return true;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-common.h b/ggml/src/ggml-vulkan/ggml-vulkan-common.h
+index 66b7557be..5a268148d 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-common.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-common.h
+@@ -129,7 +129,7 @@ void ggml_vk_rwkv_wkv6(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_t
+ void ggml_vk_rwkv_wkv7(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst);
+ void ggml_vk_gated_linear_attn(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst);
+ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst);
+-void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst);
++void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
+ void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst);
+ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
+ void ggml_vk_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp b/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
+index 97747e866..ee774ea84 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
+@@ -1320,7 +1320,11 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
+         } else if (tensor->op == GGML_OP_LIGHTNING_INDEXER) {
+             tensor_clone = ggml_lightning_indexer(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
+         } else if (tensor->op == GGML_OP_GATED_DELTA_NET) {
+-            tensor_clone = ggml_gated_delta_net(ggml_ctx, src_clone[0], src_clone[1],
++            tensor_clone = src_clone[6] ?
++            ggml_gated_delta_net_ids(ggml_ctx, src_clone[0], src_clone[1],
++            src_clone[2], src_clone[3], src_clone[4], src_clone[5], src_clone[6],
++            ggml_get_op_params_i32(tensor, 0)) :
++            ggml_gated_delta_net(ggml_ctx, src_clone[0], src_clone[1],
+             src_clone[2], src_clone[3], src_clone[4], src_clone[5],
+             ggml_get_op_params_i32(tensor, 0));
+         } else if (tensor->op == GGML_OP_OPT_STEP_ADAMW) {
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+index fdce443a1..04a03b2d5 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+@@ -702,8 +702,15 @@ struct vk_op_gated_delta_net_push_constants {
+     uint32_t neq1, rq3;
+     float scale;
+     uint32_t K;
++    uint32_t state_seq_stride; // floats between the initial states of two seqs (or two rows, with ids)
++    uint32_t use_ids;          // initial state of seq s is row ids[s] of the state buffer
++    uint32_t cache_out;        // snapshots go straight to the recurrent cache (fused GDN -> CPY)
++    uint32_t cache_seq_stride; // floats between the cache rows of two seqs
++    uint32_t cache_slot_stride;// floats between two snapshot slots (rollback groups) in the cache
+ };
+ 
++static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);
++
+ struct vk_op_ssm_scan_push_constants {
+     uint32_t nb02, nb03, nb12, nb13;
+     uint32_t nb21, nb22, nb31;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index e496d51bf..f7eaa7726 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -3730,7 +3730,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+             for (uint32_t kda = 0; kda < 2; kda++) {
+                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
+-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
++                    gdn_names[si][kda], gdn_len, gdn_data, "main", 9, sizeof(vk_op_gated_delta_net_push_constants),
+                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
+             }
+         }
+@@ -10319,10 +10319,15 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
+         pc, {n_tiles_kv, n_tiles_t, n_streams});
+ }
+ 
+-void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++// GATED_DELTA_NET, optionally fused with the CPY that stores its state snapshots into the recurrent cache
++// (see ggml_vk_can_fuse_gdn_cache): then the snapshots are written straight into the cache.
++void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
++    ggml_tensor * dst = cgraph->nodes[node_idx];
+     const ggml_tensor * src_q     = dst->src[0];
+     const ggml_tensor * src_v     = dst->src[2];
+     const ggml_tensor * src_beta  = dst->src[4];
++    const ggml_tensor * src_state = dst->src[5];
++    const ggml_tensor * src_ids   = dst->src[6];
+ 
+     GGML_ASSERT(dst->buffer != nullptr);
+ 
+@@ -10331,7 +10336,7 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
+     const uint32_t n_tokens = (uint32_t)src_v->ne[2];
+     const uint32_t n_seqs   = (uint32_t)src_v->ne[3];
+ 
+-    // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
++    // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs] (or rows picked by ids).
+     const uint32_t K = (uint32_t)ggml_get_op_params_i32(dst, 0);
+ 
+     const uint32_t s_off = S_v * H * n_tokens * n_seqs;
+@@ -10346,6 +10351,20 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
+     for (int i = 0; i < 6; i++) {
+         src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+     }
++    // unused bindings get a dummy
++    vk_subbuffer ids_buf   = src_ids ? ggml_vk_tensor_subbuffer(ctx, src_ids) : src_buf[5];
++    vk_subbuffer cache_buf = dst_buf;
++
++    uint32_t cache_out = 0, cache_seq_stride = 0, cache_slot_stride = 0;
++    if (ctx->num_additional_fused_ops > 0) {
++        // the fused CPY node is a view of the cache rows: [D, n_seqs, n_written]
++        const ggml_tensor * cpy = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
++        GGML_ASSERT(cpy->op == GGML_OP_CPY);
++        cache_buf         = ggml_vk_tensor_subbuffer(ctx, cpy);
++        cache_out         = 1;
++        cache_seq_stride  = (uint32_t)(cpy->nb[1] / sizeof(float));
++        cache_slot_stride = (uint32_t)(cpy->nb[2] / sizeof(float));
++    }
+ 
+     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
+     const uint32_t sq2 = (uint32_t)(src_q->nb[2] / sizeof(float));
+@@ -10360,6 +10379,8 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
+     const uint32_t neq1 = (uint32_t)src_q->ne[1];
+     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
+ 
++    const uint32_t state_seq_stride = (uint32_t)((src_ids ? src_state->nb[1] : src_state->nb[3]) / sizeof(float));
++
+     const float scale = 1.0f / sqrtf((float)S_v);
+     const vk_op_gated_delta_net_push_constants pc = {
+         H, n_tokens, n_seqs, s_off,
+@@ -10368,11 +10389,14 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
+         sb1, sb2, sb3,
+         neq1, rq3,
+         scale,
+-        K
++        K,
++        state_seq_stride,
++        src_ids ? 1u : 0u,
++        cache_out, cache_seq_stride, cache_slot_stride,
+     };
+ 
+     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
++        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, ids_buf, cache_buf},
+         pc, { H, n_seqs, S_v });
+ }
+ 
+@@ -12863,7 +12887,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
+         break;
+ 
+     case GGML_OP_GATED_DELTA_NET:
+-        ggml_vk_gated_delta_net(ctx, compute_ctx, node);
++        ggml_vk_gated_delta_net(ctx, compute_ctx, cgraph, node_idx);
+ 
+         break;
+ 
+@@ -13848,6 +13872,84 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
+     return true;
+ }
+ 
++// GATED_DELTA_NET followed (after view nodes only) by the CPY that stores its state snapshots into the recurrent
++// cache: [D, n_seqs, n_written] rows, rollback group i at slot stride nb[2] (see build_recurrent_attn). The shader
++// then writes the snapshots straight into the cache and the CPY is skipped. Returns the index distance to the CPY
++// (the number of additional fused nodes), 0 when the pattern does not match.
++// With ignore_buffers, only the graph structure is checked (graph_optimize runs before allocation).
++static int ggml_vk_gdn_cache_pattern(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx,
++                                     bool ignore_buffers) {
++    const ggml_tensor * gdn = cgraph->nodes[node_idx];
++    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return 0;
++    }
++
++    const ggml_tensor * src_v    = gdn->src[2];
++    const int64_t       S_v      = src_v->ne[0];
++    const int64_t       H        = src_v->ne[1];
++    const int64_t       n_tokens = src_v->ne[2];
++    const int64_t       n_seqs   = src_v->ne[3];
++    const int64_t       D        = S_v * S_v * H;
++    const int64_t       K        = ggml_get_op_params_i32(gdn, 0);
++    const int64_t       n_written = std::min<int64_t>(n_tokens, K);
++    const size_t        tail_off  = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
++
++    const int max_dist = 8; // fits op_srcs_fused_elementwise
++    const ggml_tensor * cpy = nullptr;
++    int dist = 0;
++    for (int j = node_idx + 1; j < cgraph->n_nodes && j <= node_idx + max_dist; ++j) {
++        ggml_tensor * n = cgraph->nodes[j];
++        if (ggml_vk_is_empty(n)) {
++            continue;
++        }
++        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++            // graph_optimize may move a node that does not read the GDN behind the CPY
++            bool reads_gdn = false;
++            for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                const ggml_tensor * src = n->src[s];
++                reads_gdn |= src && (src == gdn || src->view_src == gdn);
++            }
++            if (ignore_buffers && !reads_gdn) {
++                continue;
++            }
++            return 0;
++        }
++        cpy  = n;
++        dist = j - node_idx;
++        break;
++    }
++    if (cpy == nullptr) {
++        return 0;
++    }
++
++    const ggml_tensor * src = cpy->src[0]; // view of the snapshot tail
++    const ggml_tensor * dst = cpy->src[1]; // cache rows
++    if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off || !ggml_is_contiguous(src) ||
++        src->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
++        return 0;
++    }
++    if (dst->type != GGML_TYPE_F32 || dst->ne[0] != D || dst->ne[1] != n_seqs || dst->ne[2] != n_written || dst->ne[3] != 1 ||
++        dst->nb[0] != sizeof(float) || dst->nb[1] % sizeof(float) != 0 || dst->nb[2] % sizeof(float) != 0 ||
++        dst->nb[1] / sizeof(float) > UINT32_MAX || dst->nb[2] / sizeof(float) > UINT32_MAX) {
++        return 0;
++    }
++
++    if (ignore_buffers) {
++        return dist;
++    }
++
++    if (cpy->buffer == nullptr || get_misalign_bytes(ctx, cpy) != 0) {
++        return 0;
++    }
++    // The snapshots overwrite cache rows while other workgroups may still read their initial states. That is only
++    // safe if every seq reads its own shards (n_seqs == 1) or the initial states live elsewhere.
++    const ggml_tensor * state = gdn->src[5];
++    if (n_seqs > 1 && (gdn->src[6] != nullptr || (state->buffer && ggml_vk_tensors_overlap(state, cpy, false)))) {
++        return 0;
++    }
++    return dist;
++}
++
+ bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
+                                       int node_idx, int num_extra) {
+     const ggml_tensor * conv = cgraph->nodes[node_idx];
+@@ -14502,6 +14604,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         ctx->fused_hc_post_gate = false;
+         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
+         const char *fusion_string {};
++        bool skip_overlap_check = false;
+         if (!ctx->device->disable_fusion) {
+             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
+             if (num_adds) {
+@@ -14611,6 +14714,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 fusion_string = "SSM_CONV_SILU";
+                 op_srcs_fused_elementwise[0] = false;
+                 op_srcs_fused_elementwise[1] = true;
++            } else if (int gdn_dist = ggml_vk_gdn_cache_pattern(ctx, cgraph, i, false)) {
++                ctx->num_additional_fused_ops = gdn_dist;
++                fusion_string = "GDN_CACHE";
++                // the op writes the scores (its own dst) and the snapshots (the CPY dst)
++                ctx->fused_ops_write_mask |= 1;
++                std::fill_n(op_srcs_fused_elementwise, gdn_dist + 1, false);
++                // the state may be read from the rows the snapshots overwrite: ggml_vk_gdn_cache_pattern checked it
++                skip_overlap_check = true;
+             } else if (ggml_can_fuse_subgraph(cgraph, i, rope_view_set_rows_pattern, { i + 2 }) &&
+                        ggml_check_edges(cgraph, i, rope_view_set_rows_edges) &&
+                        ggml_vk_can_fuse_rope_set_rows(ctx, cgraph, i)) {
+@@ -14693,7 +14804,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+ 
+         // Check whether fusion would overwrite src operands while they're still in use.
+         // If so, disable fusion.
+-        if (ctx->num_additional_fused_ops) {
++        if (ctx->num_additional_fused_ops && !skip_overlap_check) {
+             // There are up to two output nodes - topk_moe has two.
+             uint32_t bits = ctx->fused_ops_write_mask & ~(1 << ctx->num_additional_fused_ops);
+             ggml_tensor *output_nodes[2] {};
+@@ -14898,6 +15009,34 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph,
+         }
+         return true;
+     };
++    // distance from a GATED_DELTA_NET to its fusable snapshot CPY (0: none), see ggml_vk_gdn_cache_pattern
++    auto const &gdn_cpy_dist = [&](int g) -> int {
++        if (used[g] || graph->nodes[g]->op != GGML_OP_GATED_DELTA_NET) {
++            return 0;
++        }
++        const int dist = ggml_vk_gdn_cache_pattern(nullptr, graph, g, true);
++        for (int j = g + 1; dist > 0 && j < g + dist; ++j) {
++            const ggml_tensor * v = graph->nodes[j];
++            if (used[j]) {
++                return 0;
++            }
++            for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                const ggml_tensor * src = v->src[s];
++                if (src && src != graph->nodes[g] && src->op != GGML_OP_NONE &&
++                    used_node_set.find(const_cast<ggml_tensor *>(src)) == used_node_set.end()) {
++                    bool in_range = false;
++                    for (int k = g + 1; k < j; ++k) {
++                        in_range |= graph->nodes[k] == src;
++                    }
++                    if (!in_range) {
++                        return 0;
++                    }
++                }
++            }
++        }
++        return dist;
++    };
++
+     while (first_unused < graph->n_nodes) {
+         std::vector<int> current_set;
+ 
+@@ -15004,6 +15143,30 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph,
+             continue;
+         }
+ 
++        // GATED_DELTA_NET + views + snapshot CPY: keep them together so the CPY can be fused into the op.
++        // The views in between must only depend on the GDN or on already scheduled/leaf tensors.
++        {
++            const int dist = gdn_cpy_dist(first_unused);
++            if (dist > 0) {
++                // the GDN, the views in between and the CPY first (the fusion needs only empty nodes between
++                // them), then the other unscheduled nodes in between (they do not depend on the CPY)
++                for (int pass = 0; pass < 2; ++pass) {
++                    for (int j = first_unused; j <= first_unused + dist; ++j) {
++                        const bool head = j == first_unused || j == first_unused + dist || is_empty(graph->nodes[j]);
++                        if (!used[j] && head == (pass == 0)) {
++                            new_order.push_back(graph->nodes[j]);
++                            used_node_set.insert(graph->nodes[j]);
++                            used[j] = true;
++                        }
++                    }
++                }
++                while (first_unused < graph->n_nodes && used[first_unused]) {
++                    first_unused++;
++                }
++                continue;
++            }
++        }
++
+         // First, grab the next unused node.
+         current_set.push_back(first_unused);
+ 
+@@ -15043,7 +15206,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph,
+                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
+                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
+                 match_pattern(rope_view_set_rows_pattern, j) ||
+-                match_pattern(hc_post_gate_pattern, j)) {
++                match_pattern(hc_post_gate_pattern, j) ||
++                gdn_cpy_dist(j) > 0) {
+                 continue;
+             }
+             bool ok = true;
+@@ -16069,6 +16233,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                         return false;
+                     }
+                 }
++                if (op->src[6] && op->src[6]->type != GGML_TYPE_I32) {
++                    return false;
++                }
+                 return op->type == GGML_TYPE_F32;
+             }
+         case GGML_OP_SSM_SCAN:
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+index 0e384330b..adddaa4fd 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+@@ -32,6 +32,11 @@ layout(push_constant) uniform Parameters {
+     uint neq1, rq3;
+     float scale;
+     uint K;
++    uint state_seq_stride;  // floats between the initial states of two seqs (rows of the state buffer with ids)
++    uint use_ids;           // initial state of seq s is row ids[s]
++    uint cache_out;         // write the snapshots straight into the recurrent cache (fused GDN -> CPY)
++    uint cache_seq_stride;  // floats between the cache rows of two seqs
++    uint cache_slot_stride; // floats between two snapshot slots in the cache
+ };
+ 
+ layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
+@@ -41,6 +46,8 @@ layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
+ layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
+ layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
+ layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
++layout(binding = 7) readonly  buffer IdsBuf   { int        data_ids[];   };
++layout(binding = 8)           buffer CacheBuf { FLOAT_TYPE data_cache[]; };
+ 
+ #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
+ shared FLOAT_TYPE temp[SUBGROUP_SIZE];
+@@ -102,8 +109,11 @@ void main() {
+     const uint iq3 = seq_id / rq3;
+ 
+     const uint state_size = S_V * S_V;
+-    // input state holds s0 only [S_v, S_v, H, n_seqs]: per-seq stride is H*D.
+-    const uint state_in_base       = (seq_id * H + head_id) * state_size;
++    // input state holds s0 only [S_v, S_v, H, n_seqs] (per-seq stride state_seq_stride), or, with ids, the
++    // state of seq s is row ids[s]. Each invocation reads its state shard before it writes any snapshot, and the
++    // shards of different invocations are disjoint, so the snapshots may overwrite the rows that were read.
++    const uint state_row           = use_ids != 0u ? uint(data_ids[seq_id]) : seq_id;
++    const uint state_in_base       = state_row * state_seq_stride + head_id * state_size;
+     // output state layout per slot: same per-(seq,head) offset as the single-slot case.
+     const uint state_out_base      = (seq_id * H + head_id) * state_size;
+     const uint state_size_per_snap = state_size * H * n_seqs;
+@@ -173,17 +183,31 @@ void main() {
+         if (K > 1u) {
+             const int target_slot = int(n_tokens) - 1 - int(t);
+             if (target_slot >= 0 && target_slot < int(K)) {
+-                const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
+-                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+-                    data_dst[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
++                if (cache_out != 0u) {
++                    const uint slot_base = uint(target_slot) * cache_slot_stride + seq_id * cache_seq_stride + head_id * state_size;
++                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
++                        data_cache[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
++                    }
++                } else {
++                    const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
++                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
++                        data_dst[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
++                    }
+                 }
+             }
+         }
+     }
+ 
+     if (K == 1u) {
+-        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+-            data_dst[s_off + state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
++        if (cache_out != 0u) {
++            const uint slot_base = seq_id * cache_seq_stride + head_id * state_size;
++            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
++                data_cache[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
++            }
++        } else {
++            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
++                data_dst[s_off + state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
++            }
+         }
+     }
+ }
+diff --git a/ggml/src/ggml-webgpu/ggml-webgpu.cpp b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
+index 15e6c784b..2af9ea37d 100644
+--- a/ggml/src/ggml-webgpu/ggml-webgpu.cpp
++++ b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
+@@ -4738,7 +4738,8 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
+         case GGML_OP_GATED_DELTA_NET:
+             {
+                 const uint32_t s_v = (uint32_t) src2->ne[0];
+-                supports_op = op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
++                supports_op = op->src[6] == nullptr &&
++                              op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                               src2->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                               op->src[4]->type == GGML_TYPE_F32 && op->src[5]->type == GGML_TYPE_F32 &&
+                               s_v <= ctx->webgpu_global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 01dc8d05c..41d3c7822 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -6440,6 +6440,53 @@ struct ggml_tensor * ggml_gated_delta_net(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_gated_delta_net_ids(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * g,
++        struct ggml_tensor  * beta,
++        struct ggml_tensor  * states,
++        struct ggml_tensor  * ids,
++        int64_t               K) {
++    const int64_t S_v    = v->ne[0];
++    const int64_t H      = v->ne[1];
++    const int64_t n_seqs = v->ne[3];
++
++    GGML_ASSERT(states->type == GGML_TYPE_F32);
++    GGML_ASSERT(states->ne[0] == S_v*S_v*H);
++    GGML_ASSERT(ggml_is_contiguous_rows(states) && states->ne[2] == 1 && states->ne[3] == 1);
++    GGML_ASSERT(ids->type == GGML_TYPE_I32);
++    GGML_ASSERT(ggml_is_vector(ids) && ids->ne[0] == n_seqs);
++
++    GGML_ASSERT(ggml_is_contiguous_rows(q) && ggml_is_contiguous_rows(k) && ggml_is_contiguous_rows(v));
++    GGML_ASSERT(ggml_is_contiguous(g) && ggml_is_contiguous(beta));
++    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
++    GGML_ASSERT(g->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32);
++    GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
++    GGML_ASSERT(beta->ne[0] == 1);
++    GGML_ASSERT(K >= 1);
++
++    const int64_t n_tokens   = v->ne[2];
++    const int64_t state_rows = K * S_v * n_seqs;
++    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++
++    ggml_set_op_params_i32(result, 0, (int32_t) K);
++
++    result->op     = GGML_OP_GATED_DELTA_NET;
++    result->src[0] = q;
++    result->src[1] = k;
++    result->src[2] = v;
++    result->src[3] = g;
++    result->src[4] = beta;
++    result->src[5] = states;
++    result->src[6] = ids;
++
++    return result;
++}
++
+ // ggml_lightning_indexer
+ 
+ struct ggml_tensor * ggml_lightning_indexer(
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index 2e15777ee..870ac9ac6 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -530,18 +530,21 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+         ggml_tensor *        g,
+         ggml_tensor *        b,
+         ggml_tensor *        s,
+-        int                  il) {
++        int                  il,
++        ggml_tensor *        s_ids) {
+     const auto * mctx_cur   = inp->mctx;
+     const auto   kv_head    = mctx_cur->get_head();
+     const uint32_t mem_size = mctx_cur->get_size();
+ 
+-    const int64_t S_v          = s->ne[0];
+-    const int64_t H_v          = s->ne[2];
+-    const int64_t n_seqs       = s->ne[3];
++    const int64_t S_v          = v->ne[0];
++    const int64_t H_v          = v->ne[1];
++    const int64_t n_seqs       = v->ne[3];
+     const int64_t n_seq_tokens = q->ne[2];
+ 
+     const bool keep = cparams.n_rs_seq > 0;
+ 
++    GGML_ASSERT(keep || s_ids == nullptr);
++
+     if (!keep) {
+         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
+         ggml_tensor * output    = attn_out.first;
+@@ -561,7 +564,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+     const int64_t K = cparams.n_rs_seq + 1;
+ 
+     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
+-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
++    ggml_tensor * gdn_out = s_ids ? ggml_gated_delta_net_ids(ctx0, q, k, v, g, b, s, s_ids, K)
++                                  : ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+     if (n_seq_tokens > 1) {
+         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+     } else {
+diff --git a/src/models/models.h b/src/models/models.h
+index a55983cfb..c760b8982 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -97,7 +97,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
+             ggml_tensor *        g,
+             ggml_tensor *        b,
+             ggml_tensor *        s,
+-            int                  il);
++            int                  il,
++            ggml_tensor *        s_ids = nullptr); // s = states [S_v*S_v*H_v, n_rows] read through s_ids, see ggml_gated_delta_net_ids
+ };
+ 
+ struct llm_build_rwkv6_base : public llm_graph_context {
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 4153e09a5..13281989a 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -396,9 +396,27 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+ 
+     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+ 
+-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+-    cb(state, "state_predelta", il);
++    // Read the SSM state straight from its cache row (ids = s_copy) instead of gathering a copy of it first
++    // (3 MiB per layer) when nothing else moves rows of this layer's cache in this graph: a single sequence and
++    // cell, no state to clear, rollback snapshots kept (the op writes them, see build_recurrent_attn) and a device
++    // that supports the ids variant. The op reads every state shard before it overwrites it, so the snapshot slots
++    // may alias the row it reads.
++    const int64_t n_embd_s = hparams.n_embd_s();
++    ggml_tensor * state     = nullptr;
++    ggml_tensor * state_ids = nullptr;
++    if (cparams.n_rs_seq > 0 && n_seqs == 1 && mctx_cur->get_n_rs() == 1 && mctx_cur->get_rs_z() < 0 &&
++        ssm_states_all->type == GGML_TYPE_F32 && getenv("LLAMA_GDN_NO_STATE_IDS") == nullptr) {
++        build_rs(inp, ssm_states_all, n_embd_s, n_seqs,
++            [&](ggml_context *, ggml_tensor * states, ggml_tensor * ids_main) {
++                state     = states;
++                state_ids = ids_main;
++                return states;
++            });
++    } else {
++        state = build_rs(inp, ssm_states_all, n_embd_s, n_seqs);
++        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
++        cb(state, "state_predelta", il);
++    }
+ 
+     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+     cb(conv_output_proper, "conv_output_raw", il);
+@@ -457,7 +475,19 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+     cb(k_conv, "k_conv_predelta", il);
+     cb(v_conv, "v_conv_predelta", il);
+ 
+-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
++    if (state_ids) {
++        // backends without the ids variant would compute garbage: ask the layer's device, else gather the state
++        ggml_tensor * probe = ggml_gated_delta_net_ids(ctx0, q_conv, k_conv, v_conv, gate, beta, state, state_ids,
++                                                       cparams.n_rs_seq + 1);
++        ggml_backend_dev_t dev = model.dev_layer(il);
++        if (dev == nullptr || !ggml_backend_dev_supports_op(dev, probe)) {
++            state     = ggml_get_rows(ctx0, state, state_ids);
++            state     = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
++            state_ids = nullptr;
++        }
++    }
++    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il,
++                                                state_ids);
+ 
+     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
+     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 74f5c50b5..b2979b05c 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -406,9 +406,27 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+ 
+     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+ 
+-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+-    cb(state, "state_predelta", il);
++    // Read the SSM state straight from its cache row (ids = s_copy) instead of gathering a copy of it first
++    // (3 MiB per layer) when nothing else moves rows of this layer's cache in this graph: a single sequence and
++    // cell, no state to clear, rollback snapshots kept (the op writes them, see build_recurrent_attn) and a device
++    // that supports the ids variant. The op reads every state shard before it overwrites it, so the snapshot slots
++    // may alias the row it reads.
++    const int64_t n_embd_s = hparams.n_embd_s();
++    ggml_tensor * state     = nullptr;
++    ggml_tensor * state_ids = nullptr;
++    if (cparams.n_rs_seq > 0 && n_seqs == 1 && mctx_cur->get_n_rs() == 1 && mctx_cur->get_rs_z() < 0 &&
++        ssm_states_all->type == GGML_TYPE_F32 && getenv("LLAMA_GDN_NO_STATE_IDS") == nullptr) {
++        build_rs(inp, ssm_states_all, n_embd_s, n_seqs,
++            [&](ggml_context *, ggml_tensor * states, ggml_tensor * ids_main) {
++                state     = states;
++                state_ids = ids_main;
++                return states;
++            });
++    } else {
++        state = build_rs(inp, ssm_states_all, n_embd_s, n_seqs);
++        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
++        cb(state, "state_predelta", il);
++    }
+ 
+     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+     cb(conv_output_proper, "conv_output_raw", il);
+@@ -467,7 +485,19 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+     cb(k_conv, "k_conv_predelta", il);
+     cb(v_conv, "v_conv_predelta", il);
+ 
+-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
++    if (state_ids) {
++        // backends without the ids variant would compute garbage: ask the layer's device, else gather the state
++        ggml_tensor * probe = ggml_gated_delta_net_ids(ctx0, q_conv, k_conv, v_conv, gate, beta, state, state_ids,
++                                                       cparams.n_rs_seq + 1);
++        ggml_backend_dev_t dev = model.dev_layer(il);
++        if (dev == nullptr || !ggml_backend_dev_supports_op(dev, probe)) {
++            state     = ggml_get_rows(ctx0, state, state_ids);
++            state     = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
++            state_ids = nullptr;
++        }
++    }
++    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il,
++                                                state_ids);
+ 
+     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
+     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index acb51f6ea..8e1654b39 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5096,6 +5096,98 @@ struct test_gated_delta_net_cache_fusion : public test_case {
+     }
+ };
+ 
++// GGML_OP_GATED_DELTA_NET with the initial states read through ids from a recurrent cache with rollback planes,
++// and the snapshot CPY back into the same cache (glm5-next layout; the backend may fuse the CPY and write in place)
++struct test_gated_delta_net_ids_cache : public test_case {
++    const int64_t head_count;
++    const int64_t head_size;
++    const int64_t n_seq_tokens;
++    const int64_t n_seqs;
++    const int64_t K;        // snapshot slots = rollback planes
++    const int64_t mem_size; // cells per plane
++    const int64_t kv_head;  // first cell written
++    const int64_t rollback; // plane the initial states are read from
++    const bool    kda;      // per-channel gate (glm5-next KDA) or one gate per head (qwen35 gated delta net)
++
++    std::string vars() override {
++        return VARS_TO_STR9(head_count, head_size, n_seq_tokens, n_seqs, K, mem_size, kv_head, rollback, kda);
++    }
++
++    test_gated_delta_net_ids_cache(int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 3,
++            int64_t n_seqs = 1, int64_t K = 3, int64_t mem_size = 2, int64_t kv_head = 1, int64_t rollback = 0,
++            bool kda = true)
++        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K),
++          mem_size(mem_size), kv_head(kv_head), rollback(rollback), kda(kda) {}
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "GATED_DELTA_NET_IDS_CACHE";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        const ggml_type type = GGML_TYPE_F32;
++        const int64_t S_v = head_size;
++        const int64_t H   = head_count;
++        const int64_t D   = S_v * S_v * H;
++        const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
++
++        ggml_tensor * q    = ggml_new_tensor_4d(ctx, type, S_v, H, n_seq_tokens, n_seqs);
++        ggml_tensor * k    = ggml_new_tensor_4d(ctx, type, S_v, H, n_seq_tokens, n_seqs);
++        ggml_tensor * v    = ggml_new_tensor_4d(ctx, type, S_v, H, n_seq_tokens, n_seqs);
++        ggml_tensor * g    = ggml_new_tensor_4d(ctx, type, kda ? S_v : 1, H, n_seq_tokens, n_seqs);
++        ggml_tensor * beta = ggml_new_tensor_4d(ctx, type, 1,   H, n_seq_tokens, n_seqs);
++        ggml_set_name(q, "q");
++        ggml_set_name(k, "k");
++        ggml_set_name(v, "v");
++        ggml_set_name(g, "g");
++        ggml_set_name(beta, "beta");
++
++        ggml_tensor * states = ggml_new_tensor_2d(ctx, type, D, mem_size * K);
++        ggml_set_name(states, "states");
++        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
++        ggml_set_name(ids, "ids");
++
++        q = ggml_l2_norm(ctx, q, 1e-6f);
++        k = ggml_l2_norm(ctx, k, 1e-6f);
++
++        ggml_tensor * gdn = ggml_gated_delta_net_ids(ctx, q, k, v, g, beta, states, ids, K);
++
++        const size_t tail_off = ggml_row_size(type, S_v * H * n_seq_tokens * n_seqs);
++        ggml_tensor * src = ggml_view_3d(ctx, gdn, D, n_seqs, n_written,
++                ggml_row_size(type, D), ggml_row_size(type, D * n_seqs), tail_off);
++        ggml_tensor * dst = ggml_view_3d(ctx, states, D, n_seqs, n_written,
++                states->nb[1], mem_size * states->nb[1], kv_head * states->nb[1]);
++        ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
++
++        // the written cache rows first, so the gdn, the views and the cpy stay adjacent
++        ggml_tensor * rows = ggml_reshape_1d(ctx, ggml_cont(ctx, cpy), D * n_seqs * n_written);
++        ggml_tensor * attn = ggml_view_1d(ctx, gdn, S_v * H * n_seq_tokens * n_seqs, 0);
++        return ggml_concat(ctx, rows, attn, 0);
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            if (ggml_is_view_op(t->op)) { continue; }
++            if (strcmp(t->name, "g") == 0) {
++                init_tensor_uniform(t, -5.0f, -1e-4f);
++            } else if (strcmp(t->name, "beta") == 0) {
++                init_tensor_uniform(t, 0.0f, 1.0f);
++            } else if (strcmp(t->name, "ids") == 0) {
++                std::vector<int32_t> data(n_seqs);
++                for (int64_t s = 0; s < n_seqs; ++s) {
++                    data[s] = (int32_t) (rollback * mem_size + kv_head + s);
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, n_seqs * sizeof(int32_t));
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++};
++
++
+ // GGML_OP_GATED_LINEAR_ATTN
+ struct test_gla : public test_case {
+     const ggml_type type;
+@@ -12096,6 +12188,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+ 
++    // initial states read in place through ids (rollback planes), snapshots written back to the cache
++    for (int64_t n_tok : { 1, 2, 3 }) {
++        for (int64_t rb : { 0, 1, 2 }) {
++            test_cases.emplace_back(new test_gated_delta_net_ids_cache(4, 32, n_tok, 1, 3, 2, 1, rb));
++            test_cases.emplace_back(new test_gated_delta_net_ids_cache(64, 128, n_tok, 1, 3, 1, 0, rb));
++        }
++    }
++    test_cases.emplace_back(new test_gated_delta_net_ids_cache(4, 32, 3, 2, 3, 4, 1, 1)); // 2 seqs: no in-place fusion
++    test_cases.emplace_back(new test_gated_delta_net_ids_cache(4, 32, 5, 1, 3, 2, 1, 0)); // n_tokens > K
++    test_cases.emplace_back(new test_gated_delta_net_ids_cache(4, 32, 1, 1, 1, 2, 1, 0)); // K == 1
++    // qwen35 (Qwen3.8-27B): 48 heads of 128, scalar gate, K = 5 (MTP n4 verify), n 1..5
++    for (int64_t n_tok : { 1, 2, 5 }) {
++        for (int64_t rb : { 0, 3 }) {
++            test_cases.emplace_back(new test_gated_delta_net_ids_cache(48, 128, n_tok, 1, 5, 2, 1, rb, false));
++        }
++    }
++
+ #if 0
+     // these tests are disabled to save execution time, sbut they can be handy for debugging
+     test_cases.emplace_back(new test_llama(2, true));
+-- 
+2.43.0
+

@@ -1,7 +1,7 @@
 # Halo Tuning
 
-Tuning four large MoE models for local inference on an **AMD Strix Halo** (Ryzen AI Max+ 395, Radeon 8060S / gfx1151,
-128 GB unified memory): **Qwen3.8-Flash-Next** on [Strata](https://github.com/Niko1221/Strata), and **Laguna-S-2.1**,
+Tuning five large models for local inference on an **AMD Strix Halo** (Ryzen AI Max+ 395, Radeon 8060S / gfx1151,
+128 GB unified memory): **Qwen3.8-Flash-Next** on [Strata](https://github.com/Niko1221/Strata), and **Qwen3.8-27B** (dense), **Laguna-S-2.1**,
 **MiMo-V2.6-Flash** and **GLM-5.3-Flash** on llama.cpp (Vulkan). Every number here was measured on one machine, and every adopted change had to
 pass the same quality gates (a long-context needle test and a 5-task agentic coding suite).
 
@@ -10,6 +10,7 @@ pass the same quality gates (a long-context needle test and a 5-task agentic cod
 | [Qwen3.8-Flash-Next](qwen-strata/) (125B-A6B, UD-IQ4_XS) | Strata v0.1.41 | **58.5–59.5** @8K, 57–58.6 @32K, 40–44.6 @128K | ~1,000–1,067 | agentic 5/5, needle 15/15 |
 | [Laguna-S-2.1](laguna/) (118B-A8B, Q4 "lean" requant) | llama.cpp Vulkan + [patches](patches/) | 33–34 plain; **code with DFlash 40.6 / 37.5 / 34.0 / 34.9** @1K / 31K / 124K / 235K; 26.4 @128K, 24.2 @245K plain | 611–653 @0, 465 @31K | agentic 5/5, needle 14–15/15 |
 | [MiMo-V2.6-Flash](mimo/) (309B-A15B, BPW2.5 + Q4_K attention) | llama.cpp Vulkan + [patches](patches/) | 30.7–32 plain; **code with DFlash 45–47 / 41–43** @1K / 31K | 323–332 @0, ~240 @32K | agentic 5/5, needle 15/15 |
+| [Qwen3.8-27B](qwen27b/) (27B dense, UD-IQ4_XS) | llama.cpp Vulkan + [27B patches](patches/llama.cpp-q27/) | **chat 40.6, code 46.8 (51.6 DFlash2), agentic edits 76–80**, ~34 @32K (stock: 27.9 / ~33 / ~33) | ~315 @2K, ~260 @32K, ~222 @60K | agentic 5/5, needle 15/15 |
 | [GLM-5.3-Flash](glm/) (320B-A18B, ~110 GiB requant, KLD 0.043) | llama.cpp Vulkan + [GLM patches](patches/llama.cpp-glm/) | **chat with MTP 28.5–29.6**, code 31–32, ~28 @32K (stock: ~15 without MTP) | 229–233 @2K, 208 @32K, 185–198 on a 60K prompt | agentic 10/10, needle 15/15 |
 
 ## The machine — and why it is not a "max settings" Strix Halo
@@ -59,15 +60,31 @@ prompt chunks at 200K+ context). Details: [platform/](platform/).
 
 The last row is a warning: a technique that is free on one model can quietly break another. Gate every model separately.
 
+## In progress (2026-10-16): the 27B methods on the other models
+
+We ported the Qwen3.8-27B work onto one unified llama.cpp branch carrying every model's patches. The new pieces that
+transfer: integer-dot IQ2/IQ3 matvecs (including the MoE expert path), flat grouped-query verify attention, wide-verify
+matvecs, `ngram-mod`, and the prompt cache. Same-session against each model's production config. **Preliminary:** the
+GLM gate has passed; the MiMo and Laguna gates are still running. The patch series will be published once they're done.
+
+| Model | Production chat / code / edits | Unified branch chat / code / edits | Notes |
+|---|---|---|---|
+| MiMo-V2.6-Flash | 28.7 / 35.3 / 43.8 | ~31–32 / 39.7 / **52.1** | integer-dot IQ2_XXS/IQ3_XXS experts; `ngram-mod` hurts (DFlash already accepts 98% on edits) |
+| Laguna-S-2.1 | 35.2 / 42.8 / 39.0 | 36.6 / 44.4 / **79.1** (+ `ngram-mod`) | +15% decode @32K; draft vocab hurt code |
+| GLM-5.3-Flash | 27.8 / 29.2 / 29.6 | 28.6 / 30.1 / 30.6 | +11% decode @32K; gate passed (needle 15/15, agentic 5/5) |
+
 ## Repository layout
 
 - [qwen-strata/](qwen-strata/) — Qwen3.8-Flash-Next on Strata: the v0.1.41 upgrade, the retune, the gap to desktop numbers.
 - [laguna/](laguna/) — Laguna-S-2.1 on llama.cpp: block-sparse decode, KV-sliced prefill, fixing DFlash at depth.
 - [mimo/](mimo/) — MiMo-V2.6-Flash on llama.cpp: the attention requant, speculation, prefill profile, thinking control.
+- [qwen27b/](qwen27b/) — Qwen3.8-27B on llama.cpp: quant, MTP draft vocabulary, prefill-at-depth and verify-round kernels,
+  n-gram drafting, the prompt cache, and Talus vs llama.cpp.
 - [glm/](glm/) — GLM-5.3-Flash on llama.cpp: non-expert requant, MTP with a draft vocabulary, sparse-attention and IQ2_S / IQ3_S
   kernels, fusions, and a matched ROCm vs Vulkan run.
 - [platform/](platform/) — Strix Halo host settings and lessons that apply to any model.
 - [patches/llama.cpp/](patches/llama.cpp/) — our llama.cpp patch series (Vulkan + speculation + Laguna/MiMo support).
+- [patches/llama.cpp-q27/](patches/llama.cpp-q27/) — the Qwen3.8-27B series (15 patches on `529ac893e`).
 - [patches/llama.cpp-glm/](patches/llama.cpp-glm/) — the GLM-5.3-Flash series (23 patches on a newer base).
 - [configs/](configs/) — the exact serving configs (paths replaced with `$PLACEHOLDERS`).
 
