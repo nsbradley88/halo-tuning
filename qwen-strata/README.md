@@ -58,6 +58,15 @@ These change rounding slightly (upstream gates them with KL); we re-gated with t
 | Batch slots (`"parallel": 2 / 4`, `--batch-mtp`), 4 concurrent clients | total 27.8–30.6 tok/s vs **32.7** one-at-a-time, and the first answer at 31–43 s vs 3.9 s |
 | Thinking off for agentic work (`reasoning_effort: none` server-wide) | agentic **4/5**: one task looped for 52 min / 560 tool calls without a fix (thinking on solves it in 90–164 s); needle 15/15. Keep thinking on for Qwen |
 
+## Warning: the hipBLASLt tuning table must match the runtime's hipBLASLt
+
+`STRATA_HIPBLASLT_TUNING` names a table built for one hipBLASLt version: `-100401` is ROCm 7.14.1, `-100500` is the
+ROCm 10.2 nightlies, and `tools/hip/` ships both. If you run a build linked against another ROCm with the 7.14.1 table,
+the engine rejects it and runs every prompt GEMM untuned. It reports this only once in the engine log:
+`hipBLASLt version mismatch: file=100401 runtime=100500; using hipBLASEx`. On a 10.2-nightly build this cut prompt speed
+from 716 to ~300 tok/s at ~1.9K and from 1,074 to 829 at ~28K. Output speed was unaffected. With the matching table it
+returned to 720 / 1,078. Check the engine log for `hipBLASLt tuning enabled` after any ROCm change.
+
 ## Warning: `--expert-cache auto` on a 128 GB unified-memory box
 
 Upstream setup's default (`--expert-cache auto`, no `--resident-budget-gib`) sized the expert cache from free RAM as if it

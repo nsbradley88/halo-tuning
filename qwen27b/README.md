@@ -8,6 +8,8 @@ Presets: [configs/qwen27b/](../configs/qwen27b/).
 
 ## Final numbers
 
+These are the llama.cpp numbers. Our HIP engine Talus is now faster on every row; see [below](#talus-our-hip-engine-on-the-same-model).
+
 Chat runs at temperature 1.0, code and edits are greedy. Edits ask the model to rewrite a ~9K-character source file and
 return it whole (an agentic edit).
 
