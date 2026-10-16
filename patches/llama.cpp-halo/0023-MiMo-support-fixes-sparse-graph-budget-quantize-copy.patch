@@ -1,0 +1,72 @@
+From c4359d1e64ff648118870354ace6e77ddd487ea1 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 12:45:21 -0400
+Subject: [PATCH 23/46] MiMo support fixes: sparse graph budget, quantize
+ copy-through, test cases
+
+- llama-context: reserve graph nodes for LLAMA_SPARSE_ATTN (64 per layer);
+  MiMo-V2.6 overflowed the graph hash set with sparse decode enabled.
+- llama-quant: only require an imatrix for tensors that change type. A
+  tensor already in its target type is copied as-is, so a partial requant
+  of an IQ release (e.g. attention only) no longer fails without the
+  original imatrix.
+- test-backend-ops: MiMo-shaped flash-attention cases (K 192 / V 128,
+  4 KV heads, GQA 16, KV 32K/131K) and nb=5 top_k / soft_max / sparse FA.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp      | 5 +++++
+ src/llama-quant.cpp        | 4 +++-
+ tests/test-backend-ops.cpp | 5 +++++
+ 3 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 544541a07..f385bb20a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2667,6 +2667,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+         }
+     }
+ 
++    // block-sparse decode attention (LLAMA_SPARSE_ATTN) adds the block-selection ops (~25 per full-attention layer)
++    if (getenv("LLAMA_SPARSE_ATTN")) {
++        res += 64u * model.hparams.n_layer();
++    }
++
+     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
+     for (const auto & [seq_id, sampler] : sampling.samplers) {
+         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index 9c6066796..2aaeeff67 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -1131,7 +1131,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+             metadata[i].target_type = tensor->type;
+         }
+ 
+-        metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
++        // a tensor already in its target type is copied as-is and needs no imatrix
++        metadata[i].requires_imatrix = metadata[i].target_type != tensor->type &&
++            tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
+ 
+         if (params->imatrix) {
+             metadata[i].remapped_imatrix_name = remap_imatrix(tensor->name, mapped);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index a53f7e04b..a107a5d08 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11938,6 +11938,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 4096));
+         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0));
+     }
++    // MiMo-V2.6 full-attention layers (K 192 / V 128, 4 KV heads, GQA 16): dense and block-sparse decode, q8_0 cache
++    for (int64_t kv : { 32768, 131072 }) for (int64_t nb : { 1, 5 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(192, 128, 4, {16, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
++        test_cases.emplace_back(new test_flash_attn_ext(192, 128, 4, {16, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 4096));
++    }
+     for (int64_t nb : { 64, 333 }) {
+         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+     }
+-- 
+2.43.0
+

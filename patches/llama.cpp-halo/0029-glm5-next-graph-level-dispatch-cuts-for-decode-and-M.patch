@@ -1,0 +1,436 @@
+From aa8d6d79a50f979460a317c88dac4ed41916f611 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 08:14:42 +0000
+Subject: [PATCH 29/46] glm5-next: graph-level dispatch cuts for decode and MTP
+ verify
+
+- KDA conv: SILU directly on the SSM_CONV output (no reshape in between), so the
+  Vulkan SSM_CONV_SILU fusion fires (-102 dispatches per graph).
+- KDA conv, small ubatches (<= 8 tokens per seq): Q/K/V share one conv window
+  tensor (one concat of the three conv states), so each rollback group is one
+  CPY for Q, K and V together instead of three, and the n>1 transposes need no
+  CONT (n=3 verify: 21 -> 9 dispatches per KDA layer).
+- Rollback groups: write only s < min(K, n_seq_tokens) conv groups. The GDN op
+  writes only min(n_seq_tokens, K) SSM snapshots, so a rollback into an older
+  group already restores a stale SSM state; nothing that worked before changes.
+- KDA: no CONT of the (contiguous) GDN score view, reshape instead of cont_2d
+  for the gated output.
+- MoE: build the shared expert before the routed experts (trunk and MTP), so
+  its add joins the expert MULTI_ADD (-42).
+- DSA indexer: reorder the top-k indices with an I32 get_rows (no f32 casts and
+  CONT); the -inf mask is one in-place FILL; zeros, live = exp(sel_mask) and the
+  dead-slot dump rows are built once per graph and shared by all indexer layers;
+  idx = idx*live + dead_dump (exact, live is 0/1).
+- build_attn_mha (MLA): skip the CONT when the permuted output is already
+  contiguous (single token).
+- Vulkan graph_optimize: do not hoist a UNARY away from a MUL it can fuse with
+  while the MUL's other operand is not ready (KDA output gate
+  rms_norm(o)*w*sigmoid(g2) now fuses as SIGMOID_MUL).
+- test-backend-ops: GLM5_CONV_QKV (concat of transposed views + SSM_CONV_SILU
+  on channel views).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp |  24 +++-
+ src/llama-graph.cpp                  |   5 +-
+ src/models/glm5-next.cpp             | 164 ++++++++++++++++++++-------
+ tests/test-backend-ops.cpp           |  51 +++++++++
+ 4 files changed, 200 insertions(+), 44 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 7a7f3f74e..66f66cf01 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -15312,6 +15312,27 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph,
+         }
+         return dist;
+     };
++    // A UNARY that could fuse with a MUL consumer whose other operand is not ready yet: hoisting it into an earlier
++    // set would separate the pair (e.g. the KDA output gate rms_norm(o)*w*sigmoid(g), where sigmoid(g) is ready long
++    // before the norm), so it is left for when it becomes the first unused node.
++    auto const &defer_unary_for_mul = [&](int u) -> bool {
++        const ggml_tensor * unary = graph->nodes[u];
++        if (unary->op != GGML_OP_UNARY) {
++            return false;
++        }
++        for (int k = u + 1; k < std::min(u + 15, graph->n_nodes); ++k) {
++            const ggml_tensor * mul = graph->nodes[k];
++            if (mul->op != GGML_OP_MUL || (mul->src[0] != unary && mul->src[1] != unary)) {
++                continue;
++            }
++            const ggml_tensor * other = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
++            if (other->op == GGML_OP_NONE || used_node_set.find(const_cast<ggml_tensor *>(other)) != used_node_set.end()) {
++                return false;
++            }
++            return ggml_vk_can_fuse_unary_mul(graph, u, k);
++        }
++        return false;
++    };
+ 
+     while (first_unused < graph->n_nodes) {
+         std::vector<int> current_set;
+@@ -15481,7 +15502,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph,
+                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
+                 match_pattern(rope_view_set_rows_pattern, j) ||
+                 match_pattern(hc_post_gate_pattern, j) ||
+-                gdn_cpy_dist(j) > 0) {
++                gdn_cpy_dist(j) > 0 ||
++                defer_unary_for_mul(j)) {
+                 continue;
+             }
+             bool ok = true;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 9d8cebe57..425378816 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2967,7 +2967,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+             cur = ggml_mul_mat(ctx0, v_mla, cur);
+             cb(cur, "fattn_mla", il);
+             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+-            cur = ggml_cont(ctx0, cur); // Needed because ggml_reshape_2d expects contiguous inputs.
++            // Needed because ggml_reshape_2d expects contiguous inputs (a single token already is).
++            if (!ggml_is_contiguous(cur)) {
++                cur = ggml_cont(ctx0, cur);
++            }
+ #endif
+         }
+ 
+diff --git a/src/models/glm5-next.cpp b/src/models/glm5-next.cpp
+index a1b722950..ec940cfea 100644
+--- a/src/models/glm5-next.cpp
++++ b/src/models/glm5-next.cpp
+@@ -212,8 +212,11 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
+ 
+     // group s holds the conv window s tokens back.
+     // [TAG_RECURRENT_ROLLBACK_SPLITS]: the last K_rs tokens must share one ubatch.
+-    for (int64_t s = 0; s < K_rs; ++s) {
+-        const int64_t s_idx = std::max<int64_t>(0, n_seq_tokens - s);
++    // Only the groups s < n_seq_tokens are written: the op writes only min(n_seq_tokens, K_rs) SSM snapshots, so a
++    // rollback into an older group would restore a stale SSM state anyway (see build_recurrent_attn).
++    const int64_t n_groups = std::min<int64_t>(K_rs, n_seq_tokens);
++    for (int64_t s = 0; s < n_groups; ++s) {
++        const int64_t s_idx = n_seq_tokens - s;
+         ggml_tensor * conv_x_s = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner, n_seqs,
+             conv_x->nb[1], conv_x->nb[2], s_idx * conv_x->nb[0]);
+         ggml_build_forward_expand(gf,
+@@ -226,12 +229,60 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
+ 
+     ggml_tensor * conv_weight = ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner);
+     ggml_tensor * Xcur = ggml_ssm_conv(ctx0, conv_x, conv_weight);
+-    Xcur = ggml_reshape_2d(ctx0, Xcur, d_inner, n_tokens);
++    // silu directly on the conv output (no reshape in between) so backends can fuse SSM_CONV + SILU
+     Xcur = ggml_silu(ctx0, Xcur);
+ 
++    GGML_UNUSED(n_tokens);
+     return ggml_reshape_4d(ctx0, Xcur, head_dim, n_head, n_seq_tokens, n_seqs);
+ }
+ 
++// Small ubatches (decode, MTP verify/draft): Q, K and V share one conv window tensor, so the conv states are
++// concatenated once and each rollback group is a single copy for all three (instead of one per Q/K/V).
++// The three conv states of a cell are stored back to back, [d_conv - 1, 3*d_inner].
++static void glm5_conv1d_qkv(ggml_cgraph * gf, ggml_context * ctx0,
++                            ggml_tensor * conv_states_all, ggml_tensor * conv_state_all,
++                            ggml_tensor * x, ggml_tensor * const proj_w[3], ggml_tensor * const conv_w[3],
++                            int64_t d_conv, int64_t head_dim, int64_t n_head,
++                            int64_t n_seq_tokens, int64_t n_seqs, int64_t kv_head,
++                            int64_t mem_size, int64_t K_rs, ggml_tensor * out[3]) {
++    const int64_t d_inner         = head_dim * n_head;
++    const int64_t conv_state_size = (d_conv - 1) * d_inner;
++    const int64_t n_embd_r_total  = 3 * conv_state_size;
++    const size_t  es              = ggml_element_size(conv_states_all);
++
++    ggml_tensor * conv_state_x = ggml_view_3d(ctx0, conv_state_all, d_conv - 1, 3*d_inner, n_seqs,
++        (d_conv - 1) * ggml_element_size(conv_state_all), n_embd_r_total * ggml_element_size(conv_state_all), 0);
++
++    // [n_seq_tokens, 3*d_inner, n_seqs]: the strided reads of the transposed views are cheap for a few tokens
++    ggml_tensor * x_t[3];
++    for (int i = 0; i < 3; ++i) {
++        ggml_tensor * x_proj = ggml_mul_mat(ctx0, proj_w[i], x);
++        x_t[i] = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs));
++    }
++    ggml_tensor * x_all  = ggml_concat(ctx0, ggml_concat(ctx0, x_t[0], x_t[1], 1), x_t[2], 1);
++    ggml_tensor * conv_x = ggml_concat(ctx0, conv_state_x, x_all, 0); // [d_conv - 1 + n_seq_tokens, 3*d_inner, n_seqs]
++
++    // rollback groups, see glm5_conv1d
++    const int64_t n_groups = std::min<int64_t>(K_rs, n_seq_tokens);
++    for (int64_t s = 0; s < n_groups; ++s) {
++        const int64_t s_idx = n_seq_tokens - s;
++        ggml_tensor * conv_x_s = ggml_view_3d(ctx0, conv_x, d_conv - 1, 3*d_inner, n_seqs,
++            conv_x->nb[1], conv_x->nb[2], s_idx * conv_x->nb[0]);
++        ggml_build_forward_expand(gf,
++            ggml_cpy(ctx0, conv_x_s,
++                ggml_view_3d(ctx0, conv_states_all, d_conv - 1, 3*d_inner, n_seqs,
++                    (d_conv - 1) * es, n_embd_r_total * es, (s * mem_size + kv_head) * n_embd_r_total * es)));
++    }
++
++    for (int i = 0; i < 3; ++i) {
++        ggml_tensor * conv_x_i = ggml_view_3d(ctx0, conv_x, conv_x->ne[0], d_inner, n_seqs,
++            conv_x->nb[1], conv_x->nb[2], i * d_inner * conv_x->nb[1]);
++        ggml_tensor * Xcur = ggml_ssm_conv(ctx0, conv_x_i, ggml_reshape_2d(ctx0, conv_w[i], d_conv, d_inner));
++        Xcur = ggml_silu(ctx0, Xcur);
++        out[i] = ggml_reshape_4d(ctx0, Xcur, head_dim, n_head, n_seq_tokens, n_seqs);
++    }
++}
++
+ 
+ // K-pool indexer inputs
+ class llama_model_glm5_next::llm_graph_input_kpool : public llm_graph_input_i {
+@@ -275,6 +326,11 @@ public:
+     ggml_tensor * new_pool_idxs = nullptr; // I32     [kpool, n_new]   members of the pools completed this ubatch
+     ggml_tensor * new_pool_rep  = nullptr; // I64     [n_new]          cell to write each new pooled key into
+ 
++    // derived from the inputs once per graph and shared by all indexer layers (see build_kpool_select)
++    ggml_tensor * sel_zeros     = nullptr; // F32     [1, n_sel, n_tokens] scatter values
++    ggml_tensor * sel_live      = nullptr; // F32     [n_sel, n_tokens]    1 for live selection slots, 0 for dead ones
++    ggml_tensor * sel_dead_dump = nullptr; // F32     [n_sel, n_tokens]    dump row n_kv + slot for dead slots, 0 for live ones
++
+     const llama_memory_hybrid_idx_context * mctx;
+     const uint32_t kpool;
+     uint32_t n_new = 0;
+@@ -623,6 +679,15 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
+     cur = build_norm(ffn_inp, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+     cb(cur, "mtp_ffn_norm", il);
+ 
++    // shared expert first, see the trunk
++    ggml_tensor * ffn_shexp = build_ffn(cur,
++            layer.ffn_up_shexp,   nullptr, nullptr,
++            layer.ffn_gate_shexp, nullptr, nullptr,
++            layer.ffn_down_shexp, nullptr, nullptr,
++            nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
++    cb(ffn_shexp, "mtp_ffn_shexp", il);
++    ggml_build_forward_expand(gf, ffn_shexp);
++
+     ggml_tensor * moe_out = build_moe_ffn(cur,
+             layer.ffn_gate_inp,
+             layer.ffn_up_exps,
+@@ -636,13 +701,6 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
+             il);
+     cb(moe_out, "mtp_ffn_moe_out", il);
+ 
+-    ggml_tensor * ffn_shexp = build_ffn(cur,
+-            layer.ffn_up_shexp,   nullptr, nullptr,
+-            layer.ffn_gate_shexp, nullptr, nullptr,
+-            layer.ffn_down_shexp, nullptr, nullptr,
+-            nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+-    cb(ffn_shexp, "mtp_ffn_shexp", il);
+-
+     cur = ggml_add(ctx0, moe_out, ffn_shexp);
+     cb(cur, "mtp_ffn_out", il);
+ 
+@@ -744,6 +802,15 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
+                     nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+             cb(cur, "ffn_out", il);
+         } else {
++            // shared expert first, so its add directly follows the expert adds and joins their MULTI_ADD
++            ggml_tensor * ffn_shexp = build_ffn(cur,
++                    layer.ffn_up_shexp,   nullptr, nullptr,
++                    layer.ffn_gate_shexp, nullptr, nullptr,
++                    layer.ffn_down_shexp, nullptr, nullptr,
++                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
++            cb(ffn_shexp, "ffn_shexp", il);
++            ggml_build_forward_expand(gf, ffn_shexp);
++
+             ggml_tensor * moe_out = build_moe_ffn(cur,
+                     layer.ffn_gate_inp,
+                     layer.ffn_up_exps,
+@@ -757,13 +824,6 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
+                     il);
+             cb(moe_out, "ffn_moe_out", il);
+ 
+-            ggml_tensor * ffn_shexp = build_ffn(cur,
+-                    layer.ffn_up_shexp,   nullptr, nullptr,
+-                    layer.ffn_gate_shexp, nullptr, nullptr,
+-                    layer.ffn_down_shexp, nullptr, nullptr,
+-                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+-            cb(ffn_shexp, "ffn_shexp", il);
+-
+             cur = ggml_add(ctx0, moe_out, ffn_shexp);
+             cb(cur, "ffn_out", il);
+         }
+@@ -817,9 +877,23 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
+     const int64_t mem_size = mctx_cur->get_size();
+     const int64_t K_rs     = (int64_t) cparams.n_rs_seq + 1;
+ 
+-    ggml_tensor * Qcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
+-    ggml_tensor * Kcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
+-    ggml_tensor * Vcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
++    ggml_tensor * Qcur;
++    ggml_tensor * Kcur;
++    ggml_tensor * Vcur;
++    if (n_seq_tokens <= 8) {
++        ggml_tensor * const proj_w[3] = { layer.wq, layer.wk, layer.wv };
++        ggml_tensor * const conv_w[3] = { layer.ssm_q_conv, layer.ssm_k_conv, layer.ssm_v_conv };
++        ggml_tensor * qkv[3];
++        glm5_conv1d_qkv(gf, ctx0, conv_states_all, conv_state_all, cur, proj_w, conv_w, d_conv, head_dim, n_head_kda,
++                        n_seq_tokens, n_seqs, kv_head, mem_size, K_rs, qkv);
++        Qcur = qkv[0];
++        Kcur = qkv[1];
++        Vcur = qkv[2];
++    } else {
++        Qcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
++        Kcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
++        Vcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
++    }
+     cb(Qcur, "kda_q_conv", il);
+     cb(Kcur, "kda_k_conv", il);
+     cb(Vcur, "kda_v_conv", il);
+@@ -850,17 +924,18 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
+     beta = ggml_sigmoid(ctx0, beta);
+     cb(beta, "kda_beta", il);
+ 
+-    ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
+-    ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
+-    state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head_kda, n_seqs);
+-
+     // Match FLA l2 norm
+     constexpr float l2_eps = 1e-6f;
+     Qcur = build_gdn_l2_norm(ctx0, Qcur, l2_eps);
+     Kcur = build_gdn_l2_norm(ctx0, Kcur, l2_eps);
+ 
++    ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
++    ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
++    state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head_kda, n_seqs);
++
+     ggml_tensor * output = build_recurrent_attn(inp_rs, ssm_states_all, Qcur, Kcur, Vcur, g1, beta, state, il);
+-    output = ggml_cont(ctx0, output);
++    // the scores are the contiguous head of the op output, no copy needed
++    GGML_ASSERT(ggml_is_contiguous(output));
+     cb(output, "kda_scan_out", il);
+ 
+     // output gate, then RMSNorm(o) * Sigmoid(g2)
+@@ -874,7 +949,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
+     cb(normed, "kda_normed", il);
+     ggml_tensor * gated = ggml_mul(ctx0, normed, ggml_sigmoid(ctx0, g2));
+ 
+-    gated = ggml_cont_2d(ctx0, gated, d_inner, n_tokens);
++    gated = ggml_reshape_2d(ctx0, gated, d_inner, n_tokens);
+     cur   = ggml_mul_mat(ctx0, layer.wo, gated);
+     cb(cur, "kda_out", il);
+ 
+@@ -973,9 +1048,9 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
+                 ggml_reshape_3d(ctx0, score, 1, n_pool, n_tokens), top_k); // [1, n_top_pool, n_tokens]
+         ggml_tensor * sel_order = ggml_argsort(ctx0,
+                 ggml_reshape_2d(ctx0, sel_score, n_top_pool, n_tokens), GGML_SORT_ORDER_DESC);
+-        top_k = ggml_get_rows(ctx0,
+-                ggml_reshape_3d(ctx0, ggml_cast(ctx0, top_k, GGML_TYPE_F32), 1, n_top_pool, n_tokens), sel_order);
+-        top_k = ggml_cast(ctx0, ggml_cont(ctx0, ggml_reshape_2d(ctx0, top_k, n_top_pool, n_tokens)), GGML_TYPE_I32);
++        // get_rows keeps I32 rows as I32, so the indices are reordered without casts
++        top_k = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, top_k, 1, n_top_pool, n_tokens), sel_order);
++        top_k = ggml_reshape_2d(ctx0, top_k, n_top_pool, n_tokens);
+         cb(top_k, "indexer_top_k", il);
+ 
+         sel_idx = ggml_get_rows(ctx0, inp_kpool->pool_idxs,
+@@ -992,23 +1067,28 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
+ 
+     ggml_build_forward_expand(gf, sel_idx);
+ 
+-    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, kq_mask->type, n_kv + n_sel, 1, 1, 1);
+-    mask_all = ggml_fill(ctx0, mask_all, -INFINITY);
+-    mask_all = ggml_repeat_4d(ctx0, mask_all, n_kv + n_sel, n_tokens, 1, 1);
+-    mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + n_sel, n_tokens);
+-
+-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sel, 1, 1, 1);
+-    zeros = ggml_fill(ctx0, zeros, 0.0f);
+-    zeros = ggml_repeat_4d(ctx0, zeros, n_sel, n_tokens, 1, 1);
+-    zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
++    // filled in place: the scatter below writes into it, so each layer needs its own
++    ggml_tensor * mask_all = ggml_new_tensor_3d(ctx0, kq_mask->type, 1, n_kv + n_sel, n_tokens);
++    mask_all = ggml_fill_inplace(ctx0, mask_all, -INFINITY);
+ 
+     // Live slots (visible pools, real tail cells) address disjoint cells. Each dead slot writes its own dump row
+-    // n_kv + slot, so the scatter indices of a token are unique: idx = dump + live*(idx - dump), live = exp(mask).
++    // n_kv + slot, so the scatter indices of a token are unique: idx = live*idx + (1 - live)*dump, live = exp(mask).
++    // Everything but idx is the same in every indexer layer, so it is built once per graph. All values are exact
++    // small integers in F32 (live is exactly 0 or 1).
+     GGML_ASSERT(inp_kpool->sel_mask->ne[0] == n_sel && inp_kpool->sel_mask->ne[3] == n_tokens);
+-    ggml_tensor * live  = ggml_exp(ctx0, ggml_reshape_2d(ctx0, inp_kpool->sel_mask, n_sel, n_tokens));
+-    ggml_tensor * dump  = ggml_arange(ctx0, (float) n_kv, (float) (n_kv + n_sel), 1.0f);
++    if (inp_kpool->sel_zeros == nullptr) {
++        ggml_tensor * zeros = ggml_new_tensor_3d(ctx0, kq_mask->type, 1, n_sel, n_tokens);
++        inp_kpool->sel_zeros = ggml_fill_inplace(ctx0, zeros, 0.0f);
++
++        ggml_tensor * live = ggml_exp(ctx0, ggml_reshape_2d(ctx0, inp_kpool->sel_mask, n_sel, n_tokens));
++        ggml_tensor * dump = ggml_arange(ctx0, (float) n_kv, (float) (n_kv + n_sel), 1.0f);
++        inp_kpool->sel_live      = live;
++        inp_kpool->sel_dead_dump = ggml_sub(ctx0, ggml_repeat(ctx0, dump, live), ggml_mul(ctx0, live, dump));
++    }
++    ggml_tensor * zeros = inp_kpool->sel_zeros;
++
+     ggml_tensor * idx_f = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
+-    idx_f   = ggml_add(ctx0, ggml_mul(ctx0, ggml_sub(ctx0, idx_f, dump), live), dump);
++    idx_f   = ggml_add(ctx0, ggml_mul(ctx0, idx_f, inp_kpool->sel_live), inp_kpool->sel_dead_dump);
+     sel_idx = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
+ 
+     ggml_tensor * sel = ggml_set_rows(ctx0, mask_all, zeros, ggml_reshape_3d(ctx0, sel_idx, n_sel, n_tokens, 1));
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f6aeff2df..3c9502c4d 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5188,6 +5188,52 @@ struct test_gated_delta_net_ids_cache : public test_case {
+ };
+ 
+ 
++// glm5-next small-ubatch KDA conv: Q/K/V conv windows concatenated once, three SSM_CONV(+SILU) on channel views
++struct test_glm5_conv_qkv : public test_case {
++    const int64_t d_inner;
++    const int64_t n_seq_tokens;
++    const int64_t n_seqs;
++
++    std::string vars() override {
++        return VARS_TO_STR3(d_inner, n_seq_tokens, n_seqs);
++    }
++
++    test_glm5_conv_qkv(int64_t d_inner = 256, int64_t n_seq_tokens = 3, int64_t n_seqs = 1)
++        : d_inner(d_inner), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "GLM5_CONV_QKV";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        const int64_t d_conv = 4;
++        ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, 3*d_inner, n_seqs);
++        ggml_tensor * x_t[3];
++        ggml_tensor * w[3];
++        for (int i = 0; i < 3; ++i) {
++            ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_seq_tokens, n_seqs);
++            x_t[i] = ggml_transpose(ctx, x);
++            w[i]   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, d_inner);
++        }
++        ggml_tensor * x_all  = ggml_concat(ctx, ggml_concat(ctx, x_t[0], x_t[1], 1), x_t[2], 1);
++        ggml_tensor * conv_x = ggml_concat(ctx, state, x_all, 0);
++        ggml_tensor * out = nullptr;
++        for (int i = 0; i < 3; ++i) {
++            ggml_tensor * xi = ggml_view_3d(ctx, conv_x, conv_x->ne[0], d_inner, n_seqs,
++                    conv_x->nb[1], conv_x->nb[2], i * d_inner * conv_x->nb[1]);
++            ggml_tensor * y = ggml_silu(ctx, ggml_ssm_conv(ctx, xi, w[i]));
++            out = out ? ggml_concat(ctx, out, y, 0) : y;
++        }
++        // the rollback windows
++        ggml_tensor * win = ggml_cont(ctx, ggml_view_3d(ctx, conv_x, d_conv - 1, 3*d_inner, n_seqs,
++                conv_x->nb[1], conv_x->nb[2], n_seq_tokens * conv_x->nb[0]));
++        return ggml_concat(ctx, ggml_reshape_1d(ctx, out, ggml_nelements(out)), ggml_reshape_1d(ctx, win, ggml_nelements(win)), 0);
++    }
++};
++
+ // GGML_OP_GATED_LINEAR_ATTN
+ struct test_gla : public test_case {
+     const ggml_type type;
+@@ -12272,6 +12318,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32,   4, 2, 2, false, true,  /*K=*/4));
+ 
+     // gdn + cache cpy fusion (K > 1)
++    for (int64_t n_tok : { 1, 2, 3, 8 }) {
++        test_cases.emplace_back(new test_glm5_conv_qkv(256, n_tok, 1));
++        test_cases.emplace_back(new test_glm5_conv_qkv(8192, n_tok, 1));
++    }
++    test_cases.emplace_back(new test_glm5_conv_qkv(256, 3, 2));
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
+-- 
+2.43.0
+

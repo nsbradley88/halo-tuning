@@ -3,8 +3,9 @@
 Model: zai-org GLM-5.3-Flash (320B total / 18B active MoE; 45 layers + 1 MTP layer: 34 KDA linear-attention layers and 11
 DSA sparse-attention layers (MLA, lightning indexer, top-2048 keys), mHC residual streams, 288 experts top-8 plus a shared
 expert, 3 dense blocks). Starting quant: Unsloth `UD-IQ3_XXS` (112 GiB).
-Engine: llama.cpp `efe3626b1` + our [GLM patch series](../patches/llama.cpp-glm/), Vulkan (RADV), f16 KV, 65,536 context.
-Preset: [configs/glm/](../configs/glm/).
+Engine: llama.cpp `529ac893e` + our [unified patch series](../patches/llama.cpp-halo/) (recommended; the first numbers below
+are from `efe3626b1` + the [GLM series](../patches/llama.cpp-glm/)), Vulkan (RADV), f16 KV, 65,536 context.
+Presets: [configs/glm/](../configs/glm/) (`glm-5.3-flash-halo.env` for the unified build).
 
 This is the largest model we run: ~110 GiB of weights on a 128 GB machine. It only fits with the GUI off and a 120 GiB GTT pool
 (see [Memory](#memory)), and its decode speed is set by how many bytes each token reads.
@@ -32,6 +33,36 @@ How we got there, in steps (each A/B'd against a same-session baseline):
 | sparse prefill FA, KDA concat fix, a4e3s, ub 1024, draft ubatch 128 | — | 172 / 147 |
 | int8 coopmat matmul for IQ2_S / IQ3_S experts | — | 203 / 172 |
 | decode indexer + sparse FA kernels, verify matvecs, fusions, probabilistic drafting, draft vocab | **28.5–29.6** | **229 / 208** |
+
+## Unified build (2026-10-16)
+
+The GLM series ported onto the Qwen3.8-27B branch ([unified series](../patches/llama.cpp-halo/)). Same session against the
+`efe3626b1` build with the same flags, on the 27B harness (chat: 6 prompts at temperature 1.0; code: 6 greedy; edits: three
+~9 KB C++ files rewritten whole, greedy).
+
+| tok/s | `efe3626b1` + GLM series | **Unified build + workgroup-rule env** |
+|---|---|---|
+| Chat | 27.8–28.0 (0.68) | **28.6**, +2.5% |
+| Code | 29.2–29.4 (0.74) | **30.1**, +2.5% |
+| Agentic edits | 29.6–29.8 | 30.0 |
+| Decode @2K / 32K (128 tokens) | 24.7 / 27.1 | **25.8 / 29.9**, +4% / +10% |
+| Prompt @2K / 32K | 236 / 213 | 238 / 216 |
+
+Quality: KLD vs the release logits (2,048 context, `-ub 3` = the verify matvec path) 0.04194 → **0.04191**. Gate on the
+adopted config: **needle 15/15** at 60K (prompt 205–207 tok/s), **agentic 5/5** (1,098 s).
+
+- **Set `GGML_VK_DMMV_LARGE_MAX_M=1024 GGML_VK_DMMV_LARGE_MIN_K=8192`.** The GLM series' RDNA3 matvec workgroup rule
+  (patch 0018 there) is an opt-in knob on the unified build; without it decode at 2K falls to 22.0.
+- The gain is at depth, from the merged FA / matvec work. GLM's experts were already near the bandwidth roofline: the new
+  integer-dot IQ2_S / IQ3_S expert matvec gives ~1–3% here (16% in isolation at 5 tokens; GLM verifies 3).
+- **Memory is unchanged and still tight:** 7–9 GiB MemAvailable while serving, the same as the older build and far below
+  our usual 20 GiB rule. Keep the MemAvailable watchdog ([Memory](#memory)); the host prompt cache was not tested (no headroom).
+
+| Also tried on the unified build | Result |
+|---|---|
+| MTP 3-token drafts | chat 26.9, code 28.1: still slower than 2 |
+| `ngram-mod` next to MTP | edits **−12%** (30.0 → 26.4) |
+| Integer-dot expert matvec off | chat 28.2, code 29.1 |
 
 ## What worked
 
@@ -121,15 +152,18 @@ build whose GLM path was untuned (pp512 ≈ 60 tok/s). With tuned Vulkan kernels
 ## Reproduce
 
 ```sh
-git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp && git checkout efe3626b1
-git am /path/to/halo-tuning/patches/llama.cpp-glm/*.patch
+git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp && git checkout 529ac893e
+git am /path/to/halo-tuning/patches/llama.cpp-halo/*.patch
 cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 
+export GGML_VK_DMMV_LARGE_MAX_M=1024 GGML_VK_DMMV_LARGE_MIN_K=8192
 llama-server -m GLM-5.3-Flash-a4e3s-00001-of-00004.gguf --jinja -ngl 99 -ub 1024 --load-mode none -c 65536 \
   --parallel 1 -ctxcp 4 --cache-ram 0 --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-ubatch 128 \
   --spec-draft-sampling probabilistic --spec-draft-vocab glm-dv-65536.bin
 # client: temperature 1.0, top_p 0.95; reasoning_effort via chat_template_kwargs
 ```
+
+The older build (`efe3626b1` + the [GLM series](../patches/llama.cpp-glm/)) runs the same command without the environment.
 
 Requant (from the release, with an imatrix; ours: 150 × 512-token chunks of mixed docs / code / agent text):
 

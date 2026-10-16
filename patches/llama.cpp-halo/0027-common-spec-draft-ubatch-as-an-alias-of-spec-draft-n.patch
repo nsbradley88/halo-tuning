@@ -1,0 +1,30 @@
+From f9c34a91243635452ddd28a95e72719b8102e20e Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 17:20:03 +0000
+Subject: [PATCH 27/46] common: --spec-draft-ubatch as an alias of
+ --spec-draft-n-ubatch
+
+GLM patch 0006 (--spec-draft-ubatch) is superseded by upstream's --spec-draft-n-ubatch (#30459), which sets
+the same draft-context ubatch; the alias keeps the GLM serving flags working.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/arg.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 3a88e2615..f8aa84a66 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -4174,7 +4174,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         }
+     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+     add_opt(common_arg(
+-        {"--spec-draft-n-ubatch"}, "N",
++        {"--spec-draft-n-ubatch", "--spec-draft-ubatch"}, "N",
+         string_format("physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: %d - same as --n-ubatch)", params.speculative.draft.n_ubatch),
+         [](common_params & params, int value) {
+             if (value < 0) {
+-- 
+2.43.0
+

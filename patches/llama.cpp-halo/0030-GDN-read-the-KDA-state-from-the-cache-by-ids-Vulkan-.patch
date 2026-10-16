@@ -1,0 +1,87 @@
+From ebce1c9ca70a3aa118d114f23f6964100dd2f909 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 08:14:50 +0000
+Subject: [PATCH 30/46] GDN: read the KDA state from the cache by ids, Vulkan
+ writes snapshots back in place
+
+- ggml_gated_delta_net_ids(q, k, v, g, beta, states, ids, K): the initial
+  state of seq s is row ids[s] of states (src[6]). CPU reference; Vulkan binds
+  ids; every other backend reports it unsupported in supports_op.
+- glm5-next KDA (rollback snapshots on, one seq, one cell, no state to clear):
+  read the SSM state straight from its cache row through s_copy instead of the
+  4 MiB build_rs gather per layer, if the layer's device supports the op.
+- Vulkan: fuse GATED_DELTA_NET -> views -> CPY of its snapshots into the
+  recurrent cache (GDN_CACHE): the shader writes the snapshots to the cache
+  rows directly (per-seq and per-slot strides from the CPY view) and the CPY is
+  skipped (port of the CUDA/SYCL fusion; upstream draft #27973 bound the wrong
+  buffer and ignored the slot stride, so this is a rewrite). Every invocation
+  reads its state shard before writing any snapshot, so the snapshot rows may
+  alias the rows read through ids; with ids, the fusion requires n_seqs == 1.
+  graph_optimize keeps GDN + views + CPY adjacent.
+- test-backend-ops: GATED_DELTA_NET_IDS_CACHE (glm5-next cache layout with K
+  rollback planes, ids into each plane, in-place snapshot write; n 1-5, K 1/3,
+  1-2 seqs, H 64 S 128).
+
+Upstream #30139 (read recurrent states in place) does nothing for this config:
+it turns itself off when rollback snapshots are kept (n_rs_seq > 0).
+
+halo port: the op, CPU reference, Vulkan GDN_CACHE fusion and tests already exist in q27-tune (84540a577 /
+adba1b90a, a port of this patch with the ids-binding fix and the layer-0 grouping); only the glm5-next part remains.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/models/glm5-next.cpp | 37 ++++++++++++++++++++++++++++++++++---
+ 1 file changed, 34 insertions(+), 3 deletions(-)
+
+diff --git a/src/models/glm5-next.cpp b/src/models/glm5-next.cpp
+index ec940cfea..71703ec38 100644
+--- a/src/models/glm5-next.cpp
++++ b/src/models/glm5-next.cpp
+@@ -930,10 +930,41 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
+     Kcur = build_gdn_l2_norm(ctx0, Kcur, l2_eps);
+ 
+     ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
+-    ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
+-    state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head_kda, n_seqs);
+ 
+-    ggml_tensor * output = build_recurrent_attn(inp_rs, ssm_states_all, Qcur, Kcur, Vcur, g1, beta, state, il);
++    // Read the SSM state straight from its cache row (ids = s_copy) instead of gathering a copy of it first
++    // (4 MiB per layer). Only when nothing else moves rows of this layer's cache in this graph: a single
++    // sequence and cell, no state to clear, and the rollback snapshots kept (the op writes them, see
++    // build_recurrent_attn). The op reads every state shard before it overwrites it, so the snapshot slots may
++    // alias the row it reads.
++    const int64_t n_embd_s = hparams.n_embd_s();
++    bool state_ids = cparams.n_rs_seq > 0 && n_seqs == 1 && mctx_cur->get_n_rs() == 1 && mctx_cur->get_rs_z() < 0 &&
++                     ssm_states_all->type == GGML_TYPE_F32;
++    if (state_ids) {
++        // backends without ids support would compute garbage, so ask the layer's device
++        ggml_tensor * states_2d = ggml_reshape_2d(ctx0, ssm_states_all, n_embd_s, ssm_states_all->ne[1]);
++        ggml_tensor * probe = ggml_gated_delta_net_ids(ctx0, Qcur, Kcur, Vcur, g1, beta, states_2d, inp_rs->s_copy_main,
++                                                       cparams.n_rs_seq + 1);
++        ggml_backend_dev_t dev = model.dev_layer(il);
++        state_ids = dev != nullptr && ggml_backend_dev_supports_op(dev, probe);
++    }
++
++    ggml_tensor * output;
++    if (state_ids) {
++        ggml_tensor * states_2d = nullptr;
++        ggml_tensor * ids       = nullptr;
++        build_rs(inp_rs, ssm_states_all, n_embd_s, n_seqs,
++            [&](ggml_context *, ggml_tensor * states, ggml_tensor * ids_main) {
++                states_2d = states;
++                ids       = ids_main;
++                return states;
++            });
++        GGML_ASSERT(states_2d != nullptr && ids != nullptr);
++        output = build_recurrent_attn(inp_rs, ssm_states_all, Qcur, Kcur, Vcur, g1, beta, states_2d, il, ids);
++    } else {
++        ggml_tensor * state = build_rs(inp_rs, ssm_states_all, n_embd_s, n_seqs);
++        state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head_kda, n_seqs);
++        output = build_recurrent_attn(inp_rs, ssm_states_all, Qcur, Kcur, Vcur, g1, beta, state, il);
++    }
+     // the scores are the contiguous head of the op output, no copy needed
+     GGML_ASSERT(ggml_is_contiguous(output));
+     cb(output, "kda_scan_out", il);
+-- 
+2.43.0
+

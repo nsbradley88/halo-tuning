@@ -1,0 +1,147 @@
+From 6eb9216a8c31d46f0ad90509bd85690c134b1cc3 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 05:41:18 +0000
+Subject: [PATCH 14/46] speculative: draft-vocabulary subset for DFlash2
+ drafters (--spec-draft-vocab)
+
+DFlash2 drafters reuse the target's output head (248320 x 5120, Q5_K in UD-IQ4_XS: 4.1 ms of a 12 ms draft
+pass on Radeon 8060S) only to pick top-k candidates for the selector. llama_set_draft_vocab() now also accepts
+DFlash2 contexts (head from the target via ctx_other); the draft graph multiplies only the subset rows, takes
+top-k over the subset and maps the positions back to token ids (get_rows on the id table) before the selector.
+Applies only to decodes without logit outputs (draft blocks); other decodes keep the full head. Verification is
+unchanged, so the output stays exact; tokens outside the subset are never drafted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp | 16 ++++++++++++++++
+ src/llama-context.cpp  | 26 +++++++++++++++++++++-----
+ src/models/dflash.cpp  | 25 ++++++++++++++++++++++---
+ 3 files changed, 59 insertions(+), 8 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index d7ff9cf0f..509b27e42 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1113,6 +1113,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             }
+         }
+ 
++        // draft-vocabulary subset of the output head (DFlash2 only: its selector reads the head's top-k in the graph)
++        if (!this->params.vocab.empty()) {
++            std::vector<llama_token> ids;
++            if (FILE * f = fopen(this->params.vocab.c_str(), "rb")) {
++                int32_t id;
++                while (fread(&id, sizeof(id), 1, f) == 1) {
++                    ids.push_back(id);
++                }
++                fclose(f);
++            }
++            if (!is_dflash2 || ids.empty() || !llama_set_draft_vocab(ctx_dft, ids.data(), (int32_t) ids.size())) {
++                SPC_WRN("draft vocabulary '%s' not applied (%zu ids); using the full head\n",
++                        this->params.vocab.c_str(), ids.size());
++            }
++        }
++
+         // turn on extraction of the target layers' input embeddings
+         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0aa881011..1825043ce 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1374,14 +1374,30 @@ bool llama_context::set_draft_vocab(const llama_token * ids, int32_t n_ids) {
+         return true;
+     }
+ 
+-    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || (model.arch != LLM_ARCH_QWEN35 && model.arch != LLM_ARCH_QWEN35MOE) || model.hparams.n_layer_nextn == 0) {
+-        LLAMA_LOG_WARN("%s: the draft vocabulary is only supported for Qwen3.5 / Qwen3.5-MoE MTP draft contexts\n", __func__);
++    // DFlash2 drafts read the top-k of the (target's) output head through the selector: the subset head computes
++    // only the subset rows and the candidate positions map back to token ids in the graph
++    const bool is_dflash2 = model.arch == LLM_ARCH_DFLASH && model.dflash_selector_hidden != nullptr && model.d2t == nullptr;
++    if (!is_dflash2 && (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || (model.arch != LLM_ARCH_QWEN35 && model.arch != LLM_ARCH_QWEN35MOE) || model.hparams.n_layer_nextn == 0)) {
++        LLAMA_LOG_WARN("%s: the draft vocabulary is only supported for Qwen3.5 / Qwen3.5-MoE MTP and DFlash2 draft contexts\n", __func__);
+         return false;
+     }
+ 
+-    const auto & nextn = model.layers[model.hparams.n_layer()].nextn;
+-    ggml_tensor * head = nextn.shared_head_head ? nextn.shared_head_head : model.output;
+-    if (head == nullptr || head->buffer == nullptr || model.output_s != nullptr || nextn.shared_head_head_s != nullptr) {
++    ggml_tensor * head = nullptr;
++    bool head_scaled   = false;
++    if (is_dflash2) {
++        head        = model.output;
++        head_scaled = model.output_s != nullptr;
++        if (head == nullptr && cparams.ctx_other != nullptr) {
++            const llama_model & model_other = cparams.ctx_other->get_model();
++            head        = model_other.output;
++            head_scaled = model_other.output_s != nullptr;
++        }
++    } else {
++        const auto & nextn = model.layers[model.hparams.n_layer()].nextn;
++        head        = nextn.shared_head_head ? nextn.shared_head_head : model.output;
++        head_scaled = model.output_s != nullptr || nextn.shared_head_head_s != nullptr;
++    }
++    if (head == nullptr || head->buffer == nullptr || head_scaled) {
+         LLAMA_LOG_WARN("%s: unsupported output head\n", __func__);
+         return false;
+     }
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index aeeadbbd1..f31baad0a 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -470,7 +470,9 @@ static ggml_tensor * build_dflash2_conv(
+ 
+ // DFlash2 selector: top-k candidates per block position plus the pairwise
+ // transition scores, packed into the nextn output slot for the CPU-side walk.
+-static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
++// sub_ids: with a draft-vocabulary head the logits cover only the subset; sub_ids [n_sub] (I32) maps a subset
++// position to its token id
++static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, ggml_tensor * sub_ids) {
+     ggml_context * ctx0 = g.ctx0;
+     auto         & res  = g.res;
+ 
+@@ -495,6 +497,13 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
+     ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
+     ggml_tensor * unary       = ggml_reshape_2d(ctx0,
+             ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
++    if (sub_ids) {
++        GGML_ASSERT(sub_ids->ne[0] == res->t_logits->ne[0]);
++        candidates = ggml_reshape_2d(ctx0,
++                ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, sub_ids, 1, sub_ids->ne[0]),
++                    ggml_reshape_1d(ctx0, candidates, top_k * n_tokens)),
++                top_k, n_tokens);
++    }
+     ggml_tensor * gate        = g.build_lora_mm(model.dflash_selector_hidden, res->t_embd);
+ 
+     // Everything below indexes [.., tokens_per_block, n_blocks]: the block
+@@ -808,7 +817,17 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
+         output_s = model_other->output_s;
+     }
+ 
+-    cur = build_lora_mm(output, cur, output_s);
++    // draft-vocabulary subset (llama_set_draft_vocab): DFlash2 computes only the subset rows of the head; the
++    // selector maps its top-k positions back to token ids
++    // (only when no logits are read back: DFlash2 draft batches request none, other decodes keep the full head)
++    const bool dvocab = model.dflash_selector_hidden && !model.d2t && cparams.dvocab_head != nullptr && n_outputs == 0 &&
++                        output_s == nullptr && loras->empty() && cparams.dvocab_head->ne[0] == output->ne[0];
++    if (dvocab) {
++        cur = build_hadamard_input(output, cur);
++        cur = ggml_mul_mat(ctx0, cparams.dvocab_head, cur);
++    } else {
++        cur = build_lora_mm(output, cur, output_s);
++    }
+ 
+     // DFlash2 feeds these logits to the selector, so they need the target's output
+     // transforms; DFlash1 and DSpark read them through the sampler instead
+@@ -847,7 +866,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
+     }
+ 
+     if (model.dflash_selector_hidden) {
+-        build_dflash2_selector(*this, model, inp_tokens);
++        build_dflash2_selector(*this, model, inp_tokens, dvocab ? cparams.dvocab_ids : nullptr);
+     }
+ }
+ 
+-- 
+2.43.0
+

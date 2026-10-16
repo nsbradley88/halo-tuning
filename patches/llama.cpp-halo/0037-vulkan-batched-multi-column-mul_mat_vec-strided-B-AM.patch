@@ -1,0 +1,733 @@
+From 6ed5bb71fac12bda4414bedf4cd6d29b6709a03e Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 08:56:24 +0000
+Subject: [PATCH 37/46] vulkan: batched multi-column mul_mat_vec, strided B,
+ AMD large-WG knobs; GLM verify-shape tests
+
+- mul_mat_vec shaders step between B/D columns with stride_b/stride_d instead of the batch strides, so
+  2-4 columns work together with ne12*ne13 batches (batched MLA absorb at a 3-token verify ran as a GEMM:
+  q8_0 m=256 k=512 batch=64 n=3 87.8 -> 47.1 us, m=512 k=256 81.2 -> 59.2 us cold)
+- f32 B with contiguous rows and aligned strides (0213-permuted activations) is read in place
+- GGML_VK_DISABLE_BATCHED_MMV, GGML_VK_DMMV_LARGE_MAX_M / _MIN_K experiment knobs (AMD workgroup size)
+- test-backend-ops: test_mul_mat_glm with GLM-5.3-Flash decode shapes at n=1..4, plus cold-cache perf
+  variants (distinct weights beyond the 32 MiB MALL; time with GGML_VK_PERF_LOGGER)
+
+halo port: on top of q27-tune's mul_mat_vec up to 16 columns (ggml_vk_mmv_max_cols) and its off-by-default
+GGML_VK_DMMV_LARGE_* knobs; the batched case (ne12*ne13 > 1) is limited to 4 columns, and the strided-B read
+excludes the BF16-widened input.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan-types.h      |   1 +
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          |  49 +++++---
+ .../vulkan-shaders/mul_mat_vec.comp           |  32 +++---
+ .../vulkan-shaders/mul_mat_vec_base.glsl      |  18 +--
+ .../vulkan-shaders/mul_mat_vec_iq1_m.comp     |   2 +-
+ .../vulkan-shaders/mul_mat_vec_iq1_s.comp     |   2 +-
+ .../vulkan-shaders/mul_mat_vec_iq2_s.comp     |   4 +-
+ .../vulkan-shaders/mul_mat_vec_iq2_xs.comp    |   2 +-
+ .../vulkan-shaders/mul_mat_vec_iq2_xxs.comp   |   4 +-
+ .../vulkan-shaders/mul_mat_vec_iq3_s.comp     |   4 +-
+ .../vulkan-shaders/mul_mat_vec_iq3_xxs.comp   |   4 +-
+ .../vulkan-shaders/mul_mat_vec_iq4_xs.comp    |   4 +-
+ .../vulkan-shaders/mul_mat_vec_q2_k.comp      |  16 +--
+ .../vulkan-shaders/mul_mat_vec_q3_k.comp      |  16 +--
+ .../vulkan-shaders/mul_mat_vec_q4_k.comp      |   8 +-
+ .../vulkan-shaders/mul_mat_vec_q5_k.comp      |  16 +--
+ .../vulkan-shaders/mul_mat_vec_q6_k.comp      |   8 +-
+ .../vulkan-shaders/mul_mat_vec_tq1_0.comp     |   2 +-
+ .../vulkan-shaders/mul_mat_vec_tq2_0.comp     |  16 +--
+ .../vulkan-shaders/mul_mat_vecq.comp          |   2 +-
+ tests/test-backend-ops.cpp                    | 108 ++++++++++++++++++
+ 21 files changed, 220 insertions(+), 98 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index abb3120a2..4a27f5ce9 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -1020,6 +1020,7 @@ struct vk_device_struct {
+     uint32_t dmmv_large_max_m;  // AMD: large workgroup (4 subgroups) for matvecs with m <= this (and k >= 1024)
+     uint32_t dmmv_large_min_k;  // AMD: ... or m <= 4096 and k >= this (n <= 3)
+     bool     dmmv_large_force;  // experiment: large workgroup for every matvec
++    bool     disable_batched_mmv; // GGML_VK_DISABLE_BATCHED_MMV: no mul_mat_vec for 2-4 columns with batches
+     bool disable_descriptor_reuse;
+     std::atomic<uint64_t> buffer_destroy_count {};
+     bool disable_host_visible_vidmem;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index c9827281d..cd25ae35a 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -5020,6 +5020,7 @@ vk_device ggml_vk_get_device(size_t idx) {
+         device->dmmv_large_max_m = getenv("GGML_VK_DMMV_LARGE_MAX_M") ? (uint32_t) std::stoul(getenv("GGML_VK_DMMV_LARGE_MAX_M")) : 0;
+         device->dmmv_large_min_k = getenv("GGML_VK_DMMV_LARGE_MIN_K") ? (uint32_t) std::stoul(getenv("GGML_VK_DMMV_LARGE_MIN_K")) : UINT32_MAX;
+         device->dmmv_large_force = getenv("GGML_VK_DMMV_LARGE_FORCE") != nullptr;
++        device->disable_batched_mmv = getenv("GGML_VK_DISABLE_BATCHED_MMV") != nullptr;
+ 
+         device->disable_descriptor_reuse = getenv("GGML_VK_DISABLE_DESCRIPTOR_REUSE") != nullptr;
+ 
+@@ -6899,10 +6900,9 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     const uint64_t r2 = ne12 / ne02;
+     const uint64_t r3 = ne13 / ne03;
+ 
+-    // batch_n indicates that we need to compute a few vector results, and this assumes
+-    // ne12 and ne13 are 1. It overloads the batch_strides to hold the row strides.
+-    GGML_ASSERT(ne11 == 1 || ne12 * ne13 == 1);
+-    bool batch_n = ne11 > 1;
++    // Up to mul_mat_vec_max_cols columns of B per batch: the shaders step between columns with stride_b (B) and
++    // stride_d (D, which is the row count of a contiguous dst), and between batches with the batch strides.
++    GGML_ASSERT(ne11 <= mul_mat_vec_max_cols);
+ 
+     const bool x_non_contig = !ggml_vk_dim01_contiguous(src0);
+ 
+@@ -6913,13 +6913,22 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     const ggml_type y_kernel_type = widen_bf16 ? GGML_TYPE_F32 : src1->type;
+     const bool f16_f32_kernel = y_kernel_type == GGML_TYPE_F32;
+     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, src0->type);
++    // f32 B with contiguous rows but strided columns/batches (e.g. a 0213-permuted activation): read it in place
++    // instead of copying it to a contiguous buffer first.
++    const size_t y_ts = ggml_type_size(src1->type);
++    const bool y_strided = y_non_contig && !widen_bf16 && !swap_inputs && src1->type == GGML_TYPE_F32 &&
++                           src1->nb[0] == y_ts && ne10 % 4 == 0 &&
++                           src1->nb[1] % (4 * y_ts) == 0 && src1->nb[2] % (4 * y_ts) == 0 &&
++                           (ne13 == 1 || src1->nb[3] == src1->nb[2] * ne12) &&
++                           src1->nb[1] / y_ts <= UINT32_MAX && src1->nb[2] / y_ts <= UINT32_MAX &&
++                           get_misalign_bytes(ctx, src1) == 0;
+ 
+     vk_pipeline to_fp16_vk_0 = nullptr;
+     vk_pipeline to_fp16_vk_1 = nullptr;
+     if (x_non_contig) {
+         to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, src0->type);
+     }
+-    if (y_non_contig) {
++    if (y_non_contig && !y_strided) {
+         to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, y_kernel_type);
+     } else {
+         to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx, src1->type);
+@@ -6944,10 +6953,10 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     }
+ 
+     const bool qx_needs_dequant = x_non_contig;
+-    const bool qy_needs_dequant = !quantize_y && ((src1->type != GGML_TYPE_F16 && !f16_f32_kernel) || y_non_contig);
++    const bool qy_needs_dequant = !quantize_y && ((src1->type != GGML_TYPE_F16 && !f16_f32_kernel) || (y_non_contig && !y_strided));
+ 
+     // Not implemented
+-    GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
++    GGML_ASSERT((y_non_contig && !y_strided) || !qy_needs_dequant);  // NOLINT
+ 
+     GGML_ASSERT(!qx_needs_dequant || to_fp16_vk_0 != nullptr);  // NOLINT
+     GGML_ASSERT(!qy_needs_dequant || to_fp16_vk_1 != nullptr);  // NOLINT
+@@ -7013,7 +7022,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+         GGML_ASSERT(x_sz == ggml_vk_align_size(ggml_type_size(src0->type) * x_ne, ctx->device->properties.limits.minStorageBufferOffsetAlignment));
+         ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_0, src0, d_Qx, d_X);
+     }
+-    if (y_non_contig) {
++    if (y_non_contig && !y_strided) {
+         GGML_ASSERT(y_sz == ggml_type_size(y_kernel_type) * y_ne);
+         if (ctx->prealloc_y_last_pipeline_used != to_fp16_vk_1.get() ||
+             ctx->prealloc_y_last_tensor_used != src1 ||
+@@ -7041,16 +7050,19 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+         }
+     }
+ 
+-    // For batch_n, the A matrix is the same for each batch, and B/D use the row stride as the batch stride
+-    uint32_t stride_batch_x = batch_n ? 0 : (qx_needs_dequant ? ne00*ne01 : ggml_vk_batch_stride(src0));
+-    uint32_t stride_batch_y = batch_n ? ne10 : ((qy_needs_dequant || quantize_y) ? ne10*ne11 : ggml_vk_batch_stride(src1));
+-    uint32_t stride_batch_d = batch_n ? ne20 : (ne20*ne21);
++    // column stride of B (D's is ne20 == ne01, pushed as stride_d) and batch strides of A/B/D
++    const bool y_packed = qy_needs_dequant || quantize_y;
++    uint32_t stride_col_y   = y_packed ? ne10 : (uint32_t)(src1->nb[1] / y_ts);
++    uint32_t stride_batch_x = qx_needs_dequant ? ne00*ne01 : ggml_vk_batch_stride(src0);
++    uint32_t stride_batch_y = y_packed ? ne10*ne11 : (uint32_t)(src1->nb[2] / y_ts);
++    uint32_t stride_batch_d = ne20*ne21;
++    GGML_ASSERT(ne20 == ne01);
+ 
+     if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant) {
+         stride_batch_x = src0->nb[0] / ggml_type_size(src0->type);
+     }
+ 
+-    if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant) {
++    if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant && !y_strided) {
+         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
+     }
+ 
+@@ -7091,7 +7103,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+ 
+         uint32_t groups_y = std::min((uint32_t)(ne12 * ne13) - base_work_group_y, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+         const vk_mat_vec_push_constants pc = {
+-            (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
++            (uint32_t)ne00, (uint32_t)ne10, stride_col_y, (uint32_t)ne01,
+             stride_batch_x, stride_batch_y, stride_batch_d,
+             fusion_flags, base_work_group_y,
+             (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
+@@ -7111,7 +7123,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     if (x_non_contig) {
+         ctx->prealloc_x_need_sync = true;
+     }
+-    if (y_non_contig || quantize_y) {
++    if ((y_non_contig && !y_strided) || quantize_y) {
+         ctx->prealloc_y_need_sync = true;
+     }
+ }
+@@ -7577,9 +7589,10 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
+                ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+                get_misalign_bytes(ctx, src0) == 0 && get_misalign_bytes(ctx, src1) == 0 && get_misalign_bytes(ctx, dst) == 0) {
+         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx, true);
+-    // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
+-    // when ne12 and ne13 are one.
+-    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= ggml_vk_mmv_max_cols(ctx, src0, src1) && src1->ne[2] * src1->ne[3] == 1)) &&
++    // mul_mat_vec handles up to ggml_vk_mmv_max_cols columns of B per batch. With batches (ne12*ne13 > 1, e.g. the
++    // batched MLA absorb of a 2-4 token verify) it is used up to four columns, reading each weight once.
++    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= ggml_vk_mmv_max_cols(ctx, src0, src1) && src1->ne[2] * src1->ne[3] == 1) ||
++                (dst->ne[1] <= 4 && !ctx->device->disable_batched_mmv)) &&
+                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
+         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
+     } else {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
+index 34be1f72b..d9619fe5c 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
+@@ -23,21 +23,21 @@ vec4 load_b(const uint j, const uint iybs, const uint iqs, const bool lastiter,
+     OOB_w = lastiter && (iybs + iqs + y_offset*3 >= p.ncols);
+ 
+     if (!OOB_w) {
+-        return vec4(FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]),
+-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset]),
+-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset*2]),
+-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset*3]));
++        return vec4(FLOAT_TYPE(data_b[j*p.stride_b + b_offset + iybs + iqs]),
++                 FLOAT_TYPE(data_b[j*p.stride_b + b_offset + iybs + iqs + y_offset]),
++                 FLOAT_TYPE(data_b[j*p.stride_b + b_offset + iybs + iqs + y_offset*2]),
++                 FLOAT_TYPE(data_b[j*p.stride_b + b_offset + iybs + iqs + y_offset*3]));
+     } else if (!OOB_z) {
+-        return vec4(FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]),
+-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset]),
+-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset*2]),
++        return vec4(FLOAT_TYPE(data_b[j*p.stride_b + b_offset + iybs + iqs]),
++                 FLOAT_TYPE(data_b[j*p.stride_b + b_offset + iybs + iqs + y_offset]),
++                 FLOAT_TYPE(data_b[j*p.stride_b + b_offset + iybs + iqs + y_offset*2]),
+                  0);
+     } else if (!OOB_y) {
+-        return vec4(FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]),
+-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset]),
++        return vec4(FLOAT_TYPE(data_b[j*p.stride_b + b_offset + iybs + iqs]),
++                 FLOAT_TYPE(data_b[j*p.stride_b + b_offset + iybs + iqs + y_offset]),
+                  0, 0);
+     } else {
+-        return vec4(FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]),
++        return vec4(FLOAT_TYPE(data_b[j*p.stride_b + b_offset + iybs + iqs]),
+                  0, 0, 0);
+     }
+ }
+@@ -53,13 +53,13 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
+ #if QUANT_R == 2
+         // Note that we end up fetching bogus elements here, but its fine as they'll be
+         // within an accessible block.
+-        const vec4 bv02 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
+-        const vec4 bv13 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs + y_offset) / 4]);
++        const vec4 bv02 = vec4(data_b_v4[(j*p.stride_b + b_offset + iybs + iqs) / 4]);
++        const vec4 bv13 = vec4(data_b_v4[(j*p.stride_b + b_offset + iybs + iqs + y_offset) / 4]);
+         const vec4 bv0 = vec4(bv02.x, bv13.x, bv02.y, bv13.y);
+         const vec4 bv1 = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
+ #else
+-        const vec4 bv0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
+-        const vec4 bv1 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4 + 1]);
++        const vec4 bv0 = vec4(data_b_v4[(j*p.stride_b + b_offset + iybs + iqs) / 4]);
++        const vec4 bv1 = vec4(data_b_v4[(j*p.stride_b + b_offset + iybs + iqs) / 4 + 1]);
+ #endif
+ #else
+         bool OOB_y;
+@@ -122,7 +122,7 @@ void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint
+         const uint iqs = 0; // quant index
+         const uint iybs = col; // y block start index
+ 
+-        const vec4 b = data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4];
++        const vec4 b = data_b_v4[(j*p.stride_b + b_offset + iybs + iqs) / 4];
+ 
+         uint ibi = first_row*p.ncols;
+         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+@@ -143,7 +143,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+ 
+     get_offsets(a_offset, b_offset, d_offset);
+     const bool is_aligned_nonquant =
+-        p.batch_stride_b % 4 == 0 && p.ncols % 4 == 0 &&
++        p.stride_b % 4 == 0 && p.ncols % 4 == 0 &&
+         a_offset % 4 == 0 && b_offset % 4 == 0 &&
+         BLOCK_SIZE % 4 == 0 && K_PER_ITER == 4;
+ 
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_base.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_base.glsl
+index 4aeda68c7..5c70c41e6 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_base.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_base.glsl
+@@ -115,13 +115,13 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t
+                 }
+ #else
+                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+-                    temp[j][n] += FLOAT_TYPE(data_fuse0[j*p.batch_stride_d + d_offset + first_row + n]);
++                    temp[j][n] += FLOAT_TYPE(data_fuse0[j*p.stride_d + d_offset + first_row + n]);
+                 }
+                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
+-                    temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
++                    temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.stride_d + d_offset + first_row + n]);
+                 }
+ #endif
+-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
++                data_d[j*p.stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+             }
+         }
+     }
+@@ -170,13 +170,13 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
+                 }
+ #else
+                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+-                    temp[j][n] += FLOAT_TYPE(data_fuse0[j*p.batch_stride_d + d_offset + first_row + n]);
++                    temp[j][n] += FLOAT_TYPE(data_fuse0[j*p.stride_d + d_offset + first_row + n]);
+                 }
+                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
+-                    temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
++                    temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.stride_d + d_offset + first_row + n]);
+                 }
+ #endif
+-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
++                data_d[j*p.stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+             }
+         }
+     }
+@@ -215,13 +215,13 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
+                 }
+ #else
+                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+-                    tmpsh[j][n][0] += FLOAT_TYPE(data_fuse0[j*p.batch_stride_d + d_offset + first_row + n]);
++                    tmpsh[j][n][0] += FLOAT_TYPE(data_fuse0[j*p.stride_d + d_offset + first_row + n]);
+                 }
+                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
+-                    tmpsh[j][n][0] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
++                    tmpsh[j][n][0] += FLOAT_TYPE(data_fuse1[j*p.stride_d + d_offset + first_row + n]);
+                 }
+ #endif
+-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
++                data_d[j*p.stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
+             }
+         }
+     }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq1_m.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq1_m.comp
+index 3ea24a76c..6b9720724 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq1_m.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq1_m.comp
+@@ -44,7 +44,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32,
+         // Loop over columns of the output
+         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+             // Compute base index for matrix B
+-            const uint base_b_idx = (j * p.batch_stride_b + b_offset + y_idx) / 4;
++            const uint base_b_idx = (j*p.stride_b + b_offset + y_idx) / 4;
+             vec4 b_vals[8];
+ 
+             // Load 8 vec4 values from matrix B
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq1_s.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq1_s.comp
+index fd953c8fa..f7bf21e50 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq1_s.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq1_s.comp
+@@ -11,7 +11,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32,
+                      const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+     const uint y_idx_base = i * QUANT_K + 32 * ib32;
+     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+-        const uint base_b_idx = (j * p.batch_stride_b + b_offset + y_idx_base) / 4;
++        const uint base_b_idx = (j*p.stride_b + b_offset + y_idx_base) / 4;
+         [[unroll]] for (uint l = 0; l < 4; ++l) {
+             const vec4 b_val_0 = vec4(data_b_v4[base_b_idx + 2 * l]);
+             const vec4 b_val_1 = vec4(data_b_v4[base_b_idx + 2 * l + 1]);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq2_s.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq2_s.comp
+index b4f6d1d6b..43df0e8c6 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq2_s.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq2_s.comp
+@@ -29,8 +29,8 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid,
+             const vec4 grid1 = vec4(unpack8(grid.y));
+ 
+             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+-                vec4 b0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 0]);
+-                vec4 b4 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 1]);
++                vec4 b0 = vec4(data_b_v4[(j*p.stride_b + b_offset + y_idx) / 4 + 2*l + 0]);
++                vec4 b4 = vec4(data_b_v4[(j*p.stride_b + b_offset + y_idx) / 4 + 2*l + 1]);
+ 
+                 FLOAT_TYPE sum =
+                       fma(FLOAT_TYPE(b0.x), FLOAT_TYPE((sign &   1) != 0 ? -grid0.x : grid0.x),
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq2_xs.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq2_xs.comp
+index d8dafe5f7..84e52a159 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq2_xs.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq2_xs.comp
+@@ -44,7 +44,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid,
+                 const vec4 grid0 = grid0_vals[l];
+                 const vec4 grid1 = grid1_vals[l];
+                 // Precompute indices
+-                const uint b_idx = (j * p.batch_stride_b + b_offset + y_idx) / 4 + 2 * l;
++                const uint b_idx = (j*p.stride_b + b_offset + y_idx) / 4 + 2 * l;
+                 const vec4 b0 = vec4(data_b_v4[b_idx + 0]);
+                 const vec4 b4 = vec4(data_b_v4[b_idx + 1]);
+                 sum +=
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq2_xxs.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq2_xxs.comp
+index f75dcf833..2c14faf35 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq2_xxs.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq2_xxs.comp
+@@ -26,8 +26,8 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid,
+             const vec4 grid1 = vec4(unpack8(iq2xxs_grid[qs].y));
+ 
+             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+-                const vec4 b0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 0]);
+-                const vec4 b4 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 1]);
++                const vec4 b0 = vec4(data_b_v4[(j*p.stride_b + b_offset + y_idx) / 4 + 2*l + 0]);
++                const vec4 b4 = vec4(data_b_v4[(j*p.stride_b + b_offset + y_idx) / 4 + 2*l + 1]);
+ 
+                 FLOAT_TYPE sum =
+                       fma(FLOAT_TYPE(b0.x), FLOAT_TYPE((sign &   1) != 0 ? -grid0.x : grid0.x),
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_s.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_s.comp
+index 42f52b4a1..999ca1454 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_s.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_s.comp
+@@ -31,8 +31,8 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid,
+             const vec4 grid1 = vec4(unpack8(iq3s_grid[qs.y | ((qh << (7 - 2*l)) & 0x100)]));
+ 
+             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+-                const vec4 b0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 0]);
+-                const vec4 b4 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 1]);
++                const vec4 b0 = vec4(data_b_v4[(j*p.stride_b + b_offset + y_idx) / 4 + 2*l + 0]);
++                const vec4 b4 = vec4(data_b_v4[(j*p.stride_b + b_offset + y_idx) / 4 + 2*l + 1]);
+ 
+                 const FLOAT_TYPE sum =
+                       fma(FLOAT_TYPE(b0.x), FLOAT_TYPE((sign &   1) != 0 ? -grid0.x : grid0.x),
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_xxs.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_xxs.comp
+index a88898109..091831e0f 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_xxs.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_xxs.comp
+@@ -27,8 +27,8 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid,
+             const vec4 grid1 = vec4(unpack8(iq3xxs_grid[qs1]));
+ 
+             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+-                const vec4 b0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 0]);
+-                const vec4 b4 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 1]);
++                const vec4 b0 = vec4(data_b_v4[(j*p.stride_b + b_offset + y_idx) / 4 + 2*l + 0]);
++                const vec4 b4 = vec4(data_b_v4[(j*p.stride_b + b_offset + y_idx) / 4 + 2*l + 1]);
+ 
+                 FLOAT_TYPE sum =
+                       fma(FLOAT_TYPE(b0.x), FLOAT_TYPE((sign &   1) != 0 ? -grid0.x : grid0.x),
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq4_xs.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq4_xs.comp
+index a2b99d9ab..7b25837f4 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq4_xs.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq4_xs.comp
+@@ -32,8 +32,8 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32,
+             const u8vec4 q1 = unpack8((w >> 4) & 0x0F0F0F0F);
+ 
+             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+-                const vec4 b0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + l]);
+-                const vec4 b1 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 4 + l]);
++                const vec4 b0 = vec4(data_b_v4[(j*p.stride_b + b_offset + y_idx) / 4 + l]);
++                const vec4 b1 = vec4(data_b_v4[(j*p.stride_b + b_offset + y_idx) / 4 + 4 + l]);
+ 
+                 sum[j] = fma(FLOAT_TYPE(b0.x), FLOAT_TYPE(kvalues_iq4nl[q0.x]),
+                         fma(FLOAT_TYPE(b0.y), FLOAT_TYPE(kvalues_iq4nl[q0.y]),
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q2_k.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q2_k.comp
+index 975cec801..997a397f9 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q2_k.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q2_k.comp
+@@ -44,14 +44,14 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid,
+         const FLOAT_TYPEV2 dm = vec2(data_a[ib0 + i].dm);
+ 
+         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+-            vec2 b0 =   vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 +  0]);
+-            vec2 b16 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 +  8]);
+-            vec2 b32 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 16]);
+-            vec2 b48 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 24]);
+-            vec2 b64 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 32]);
+-            vec2 b80 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 40]);
+-            vec2 b96 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 48]);
+-            vec2 b112 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 56]);
++            vec2 b0 =   vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 +  0]);
++            vec2 b16 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 +  8]);
++            vec2 b32 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 16]);
++            vec2 b48 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 24]);
++            vec2 b64 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 32]);
++            vec2 b80 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 40]);
++            vec2 b96 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 48]);
++            vec2 b112 = vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 56]);
+ 
+             FLOAT_TYPE sum1 = FLOAT_TYPE(0.0);
+             FLOAT_TYPE sum2 = FLOAT_TYPE(0.0);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q3_k.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q3_k.comp
+index 93e48b790..9dfdb8231 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q3_k.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q3_k.comp
+@@ -48,14 +48,14 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ix, co
+         const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib0 + i].d);
+ 
+         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+-            vec2 b0 =   vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 +  0]);
+-            vec2 b16 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 +  8]);
+-            vec2 b32 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 16]);
+-            vec2 b48 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 24]);
+-            vec2 b64 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 32]);
+-            vec2 b80 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 40]);
+-            vec2 b96 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 48]);
+-            vec2 b112 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 56]);
++            vec2 b0 =   vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 +  0]);
++            vec2 b16 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 +  8]);
++            vec2 b32 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 16]);
++            vec2 b48 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 24]);
++            vec2 b64 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 32]);
++            vec2 b80 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 40]);
++            vec2 b96 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 48]);
++            vec2 b112 = vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 56]);
+ 
+             FLOAT_TYPE sum = FLOAT_TYPE(0.0);
+             [[unroll]] for (int l = 0; l < 2; ++l) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_k.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_k.comp
+index 93fbacc62..662970247 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_k.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_k.comp
+@@ -65,10 +65,10 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im,
+         const FLOAT_TYPE q4_15 = qs64_hi4.w;
+ 
+         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+-            vec4 by10 =  vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y1_idx) / 4    ]);
+-            vec4 by132 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y1_idx) / 4 + 8]);
+-            vec4 by20 =  vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y2_idx) / 4    ]);
+-            vec4 by232 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y2_idx) / 4 + 8]);
++            vec4 by10 =  vec4(data_b_v4[(j*p.stride_b + b_offset + y1_idx) / 4    ]);
++            vec4 by132 = vec4(data_b_v4[(j*p.stride_b + b_offset + y1_idx) / 4 + 8]);
++            vec4 by20 =  vec4(data_b_v4[(j*p.stride_b + b_offset + y2_idx) / 4    ]);
++            vec4 by232 = vec4(data_b_v4[(j*p.stride_b + b_offset + y2_idx) / 4 + 8]);
+ 
+             const FLOAT_TYPE sx = fma(FLOAT_TYPE(by10.x),      q4_0,  fma(FLOAT_TYPE(by10.y),  q4_1,  fma(FLOAT_TYPE(by10.z),  q4_2,  FLOAT_TYPE(by10.w) *  q4_3)));
+             const FLOAT_TYPE sy = fma(FLOAT_TYPE(by132.x),     q4_4,  fma(FLOAT_TYPE(by132.y), q4_5,  fma(FLOAT_TYPE(by132.z), q4_6,  FLOAT_TYPE(by132.w) * q4_7)));
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q5_k.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q5_k.comp
+index 54d7e1bcd..a47bdf6f8 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q5_k.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q5_k.comp
+@@ -77,14 +77,14 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im,
+         const FLOAT_TYPE q4_15 = qs64_80_hi4.w;
+ 
+         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+-            vec2 by10 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y1_idx) / 2     ]);
+-            vec2 by116 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y1_idx) / 2 +  8]);
+-            vec2 by132 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y1_idx) / 2 + 16]);
+-            vec2 by148 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y1_idx) / 2 + 24]);
+-            vec2 by20 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y2_idx) / 2     ]);
+-            vec2 by216 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y2_idx) / 2 +  8]);
+-            vec2 by232 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y2_idx) / 2 + 16]);
+-            vec2 by248 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y2_idx) / 2 + 24]);
++            vec2 by10 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y1_idx) / 2     ]);
++            vec2 by116 = vec2(data_b_v2[(j*p.stride_b + b_offset + y1_idx) / 2 +  8]);
++            vec2 by132 = vec2(data_b_v2[(j*p.stride_b + b_offset + y1_idx) / 2 + 16]);
++            vec2 by148 = vec2(data_b_v2[(j*p.stride_b + b_offset + y1_idx) / 2 + 24]);
++            vec2 by20 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y2_idx) / 2     ]);
++            vec2 by216 = vec2(data_b_v2[(j*p.stride_b + b_offset + y2_idx) / 2 +  8]);
++            vec2 by232 = vec2(data_b_v2[(j*p.stride_b + b_offset + y2_idx) / 2 + 16]);
++            vec2 by248 = vec2(data_b_v2[(j*p.stride_b + b_offset + y2_idx) / 2 + 24]);
+ 
+             const FLOAT_TYPE sx =
+               fma(FLOAT_TYPE(by10.x), q4_0,
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q6_k.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q6_k.comp
+index 3e89d91cb..a65a5f947 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q6_k.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q6_k.comp
+@@ -59,10 +59,10 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid,
+         const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib0 + i].d);
+ 
+         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+-            vec4 by0  = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4     ]);
+-            vec4 by32 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 +  8]);
+-            vec4 by64 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 16]);
+-            vec4 by96 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 24]);
++            vec4 by0  = vec4(data_b_v4[(j*p.stride_b + b_offset + y_idx) / 4     ]);
++            vec4 by32 = vec4(data_b_v4[(j*p.stride_b + b_offset + y_idx) / 4 +  8]);
++            vec4 by64 = vec4(data_b_v4[(j*p.stride_b + b_offset + y_idx) / 4 + 16]);
++            vec4 by96 = vec4(data_b_v4[(j*p.stride_b + b_offset + y_idx) / 4 + 24]);
+ 
+             FLOAT_TYPE sum[4] = {0, 0, 0, 0};
+             [[unroll]] for (uint l = 0; l < 4; ++l) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_tq1_0.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_tq1_0.comp
+index 2c99a268e..3a6b48037 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_tq1_0.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_tq1_0.comp
+@@ -25,7 +25,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+     for (uint nrow = 0; nrow < num_rows; ++nrow) {
+         const uint ib0 = a_offset + (first_row + nrow) * num_blocks_per_row;
+         for (uint jcol = 0; jcol < NUM_COLS; ++jcol) {
+-            const uint b_base = (jcol * p.batch_stride_b);
++            const uint b_base = (jcol * p.stride_b);
+             for (uint i = tid/8; i < num_blocks_per_row; i += gl_WorkGroupSize.x/8) {
+                 const FLOAT_TYPE d = float(data_a[ib0 + i].d);
+ 
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_tq2_0.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_tq2_0.comp
+index 689cfc42a..3b2596b5e 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_tq2_0.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_tq2_0.comp
+@@ -28,14 +28,14 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im,
+         const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib0 + i].d);
+ 
+         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+-            vec2 b0 =   vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 +  0]);
+-            vec2 b16 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 +  8]);
+-            vec2 b32 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 16]);
+-            vec2 b48 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 24]);
+-            vec2 b64 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 32]);
+-            vec2 b80 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 40]);
+-            vec2 b96 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 48]);
+-            vec2 b112 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 56]);
++            vec2 b0 =   vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 +  0]);
++            vec2 b16 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 +  8]);
++            vec2 b32 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 16]);
++            vec2 b48 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 24]);
++            vec2 b64 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 32]);
++            vec2 b80 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 40]);
++            vec2 b96 =  vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 48]);
++            vec2 b112 = vec2(data_b_v2[(j*p.stride_b + b_offset + y_idx) / 2 + 56]);
+ 
+             FLOAT_TYPE sumq = FLOAT_TYPE(0.0);
+             FLOAT_TYPE sumb = FLOAT_TYPE(0.0);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
+index fccf5f611..094ae14e6 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
+@@ -32,7 +32,7 @@ vec2 cache_b_ds;
+ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
+     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+         // Preload data_b block
+-        const uint b_block_idx = (j*p.batch_stride_b + col) / QUANT_K_Q8_1 + b_offset;
++        const uint b_block_idx = (j*p.stride_b + col) / QUANT_K_Q8_1 + b_offset;
+         const uint b_block_idx_outer = b_block_idx / 4;
+         const uint b_block_idx_inner = b_block_idx % 4;
+         cache_b_ds = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 1123263b4..442a4cca8 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9890,6 +9890,112 @@ static const ggml_type other_types[] = {
+ #pragma optimize("", off)
+ #endif
+ 
++
++// GLM-5.3-Flash (glm5-next) decode/verify matvec shapes.
++// b_perm: b is created as [k, batch, n] and permuted to [k, n, batch] (MLA absorb: q / FA output permuted 0,2,1,3),
++// while a stays a contiguous [k, m, batch] weight.
++struct test_mul_mat_glm : public test_case {
++    const ggml_type type_a;
++    const int64_t m;
++    const int64_t n;
++    const int64_t k;
++    const int64_t batch;
++    const bool b_perm;
++    const int64_t nw; // > 1: nw distinct weights and inputs, summed (cold-cache timing via GGML_VK_PERF_LOGGER)
++
++    std::string vars() override {
++        return VARS_TO_STR7(type_a, m, n, k, batch, b_perm, nw);
++    }
++
++    double max_nmse_err() override { return 5e-4; }
++
++    uint64_t op_flops(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        // the cold variant runs its graph once per timing run: report a flop count above the perf target
++        return nw > 1 ? 1000ULL * 1000 * 1000 * 1000 : 2 * m * n * k * batch;
++    }
++
++    test_mul_mat_glm(ggml_type type_a = GGML_TYPE_Q4_K, int64_t m = 4096, int64_t n = 1, int64_t k = 8192,
++            int64_t batch = 1, bool b_perm = false, int64_t nw = 1)
++        : type_a(type_a), m(m), n(n), k(k), batch(batch), b_perm(b_perm), nw(nw) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * out = nullptr;
++        for (int64_t i = 0; i < nw; ++i) {
++            ggml_tensor * a = ggml_new_tensor_3d(ctx, type_a, k, m, batch);
++            ggml_set_name(a, "a");
++            ggml_tensor * b;
++            if (b_perm) {
++                b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, batch, n);
++                ggml_set_name(b, "b");
++                b = ggml_permute(ctx, b, 0, 2, 1, 3);
++                ggml_set_name(b, "b_permuted");
++            } else {
++                b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, batch);
++                ggml_set_name(b, "b");
++            }
++            ggml_tensor * mm = ggml_mul_mat(ctx, a, b);
++            out = out ? ggml_add(ctx, out, mm) : mm;
++        }
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return ggml_op_name(GGML_OP_MUL_MAT);
++    }
++};
++
++static void add_glm_verify_mul_mat_cases(std::vector<std::unique_ptr<test_case>> & test_cases, bool perf) {
++    struct shape { ggml_type t; int64_t m, k, batch; bool b_perm; };
++    std::vector<shape> shapes = {
++        { GGML_TYPE_Q4_K,   4096,  8192,  1, false }, // KDA wo
++        { GGML_TYPE_Q4_K,   8192,  4096,  1, false }, // KDA wq/wk/wv
++        { GGML_TYPE_Q4_K,   4096, 16384,  1, false },
++        { GGML_TYPE_Q4_K,   2048,  4096,  1, false }, // shared expert
++        { GGML_TYPE_Q6_K,   4096,  8192,  1, false }, // NextN wo
++        { GGML_TYPE_Q6_K,  16384,  1536,  1, false }, // wq_b
++        { GGML_TYPE_Q8_0,    512,   256, 64, true  }, // MLA absorb wk_b
++        { GGML_TYPE_Q8_0,    256,   512, 64, true  }, // MLA absorb wv_b
++        { GGML_TYPE_Q8_0,     24, 16384,  1, false }, // mHC hc_fn
++        { GGML_TYPE_Q8_0,   8192,   128,  1, false }, // KDA f_b / g_b
++        { GGML_TYPE_Q8_0,    128,  4096,  1, false }, // KDA f_a / g_a
++        { GGML_TYPE_Q8_0,     64,  4096,  1, false }, // KDA beta
++        { GGML_TYPE_Q8_0,    512,  4096,  1, false }, // MLA wkv_a
++        { GGML_TYPE_Q4_K,   1536,  4096,  1, false }, // MLA wq_a
++        { GGML_TYPE_Q4_K,  12288,  4096,  1, false }, // dense FFN up/gate
++        { GGML_TYPE_Q4_K,   4096, 12288,  1, false }, // dense FFN down
++        { GGML_TYPE_F32,      32,  4096,  1, false }, // indexer proj
++        { GGML_TYPE_F32,     288,  4096,  1, false }, // router
++        { GGML_TYPE_F16,     288,  4096,  1, false },
++        { GGML_TYPE_BF16,    288,  4096,  1, false },
++        { GGML_TYPE_Q5_K, 154880,  4096,  1, false }, // output head
++        { GGML_TYPE_Q5_K,  40960,  4096,  1, false }, // draft-vocab head
++    };
++    for (const auto & s : shapes) {
++        if (!perf && s.m > 16384) {
++            continue;
++        }
++        for (int64_t n : {1, 2, 3, 4}) {
++            test_cases.emplace_back(new test_mul_mat_glm(s.t, s.m, n, s.k, s.batch, s.b_perm));
++        }
++    }
++    if (perf) {
++        // cold-cache variants: enough distinct weights to exceed the 32 MiB MALL of Strix Halo
++        for (const auto & s : shapes) {
++            const int64_t bytes = (int64_t) ggml_row_size(s.t, s.k) * s.m * s.batch;
++            if (bytes > 256ll*1024*1024) {
++                continue;
++            }
++            const int64_t nw = std::min<int64_t>(24, std::max<int64_t>(4, (192ll*1024*1024 + bytes - 1) / bytes));
++            for (int64_t n : {1, 2, 3, 4}) {
++                test_cases.emplace_back(new test_mul_mat_glm(s.t, s.m, n, s.k, s.batch, s.b_perm, nw));
++            }
++        }
++    }
++}
++
+ // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+ // Matvec at decode / speculative-verify shapes with optional cold weights: nw > 1 builds nw distinct weights and
+ // inputs and sums the products, so the weights exceed the GPU's last-level cache (32 MiB MALL on Strix Halo) and
+@@ -9999,6 +10105,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
+     add_q27_verify_mul_mat_cases(test_cases, false);
++    add_glm_verify_mul_mat_cases(test_cases, false);
+     std::default_random_engine rng(0);
+ 
+     // unary ops
+@@ -12569,6 +12676,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
+     add_q27_verify_mul_mat_cases(test_cases, true);
++    add_glm_verify_mul_mat_cases(test_cases, true);
+ 
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here
+-- 
+2.43.0
+

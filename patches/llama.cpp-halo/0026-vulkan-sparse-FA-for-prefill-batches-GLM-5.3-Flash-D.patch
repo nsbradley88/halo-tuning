@@ -1,0 +1,90 @@
+From ae3b2000698c4bcd5c17fb3350c4ea2e659a1c98 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:10:32 -0400
+Subject: [PATCH 26/46] vulkan: sparse FA for prefill batches (GLM-5.3-Flash
+ DSA)
+
+With a sparse hint far below the KV length, fold heads for any batch size, one query
+token per workgroup, so each tile shares that token mask row and gathers only its
+selected positions instead of running dense FA over the whole cache.
+GGML_VK_FA_SPARSE_PREFILL_RATIO sets the minimum KV / n_kv_max ratio (default 2,
+0 = off). GLM-5.3-Flash a4e3, ub 768: 32K prompt 105 -> 132 tok/s, 60K prompt
+86 -> 128 tok/s; needle 15/15 at 60K.
+
+test-backend-ops: GLM-shaped sparse FA cases for nb 64 and 512; perf cases for the
+GLM routed experts (288 x top 8, IQ2_S / IQ3_S) at prefill batch sizes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 12 ++++++++++--
+ tests/test-backend-ops.cpp           | 10 +++++++++-
+ 2 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 728ed38ac..cc94fb30a 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -8298,6 +8298,14 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+     // GGML_VK_FA_GQA_SPLIT_DISABLE turns this off.
+     static const bool gqa_split = getenv("GGML_VK_FA_GQA_SPLIT_DISABLE") == nullptr;
+     const uint32_t gqa_fold = (gqa_split && qk_ratio > max_gqa && qk_ratio % max_gqa == 0) ? max_gqa : qk_ratio;
++    // Sparse prefill: with a sparse hint far below KV, fold heads for any batch size, one query token per
++    // workgroup, so the tile shares that token's mask row and gathers only its selected positions instead of
++    // running dense FA over the whole cache (GLM-5.3-Flash DSA: 2048 of 32K+). GGML_VK_FA_SPARSE_PREFILL_RATIO is
++    // the minimum KV / n_kv_max ratio (default 2, 0 = off; 2 vs 4: +2% at 8K).
++    static const int64_t sparse_prefill_ratio = getenv("GGML_VK_FA_SPARSE_PREFILL_RATIO") ? atoll(getenv("GGML_VK_FA_SPARSE_PREFILL_RATIO")) : 2;
++    const int32_t n_kv_max_hint = mask ? ggml_get_op_params_i32(dst, 4) : 0;
++    const bool sparse_fold = sparse_prefill_ratio > 0 && n_kv_max_hint > 0 && getenv("GGML_VK_FA_SPARSE_DISABLE") == nullptr &&
++                             (int64_t)KV >= std::max<int64_t>(4096, sparse_prefill_ratio * (int64_t)n_kv_max_hint);
+ 
+     // Flat grouped-query fold for few-token batches (speculative verify): one coopmat1 row tile covers the
+     // flattened (token, query head) rows of a KV head (GQA_FLAT_BIT in flash_attn_base.glsl), so the tokens share
+@@ -8311,7 +8319,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+     }();
+     bool gqa_flat = false;
+     // the flat fold has no sparse path: a sparse mask hint (op_params[4], DSA / LLAMA_SPARSE_ATTN) keeps the per-token fold
+-    const bool fa_sparse_hint = mask && ggml_get_op_params_i32(dst, 4) > 0;
++    const bool fa_sparse_hint = n_kv_max_hint > 0;
+     if (N >= 2 && N <= gqa_flat_max_tokens && qk_ratio > 1 && !fa_sparse_hint &&
+         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1 && neq3 == 1 &&
+         (!mask || nem1 >= N) && !ctx->device->coopmat2) {
+@@ -8323,7 +8331,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+         gqa_ratio = qk_ratio;
+         N = N * qk_ratio;
+         workgroups_y /= gqa_ratio;
+-    } else if (N <= 8 && qk_ratio > 1 && gqa_fold <= max_gqa &&
++    } else if ((N <= 8 || sparse_fold) && qk_ratio > 1 && gqa_fold <= max_gqa &&
+         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
+         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
+         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 5394ee4b8..fbf44f4d2 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12055,7 +12055,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 5003, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+     // GLM-5.3-Flash DSA (MLA nope 512, V is a view of K, 64 heads on 1 KV head, budget 2048): small unfolded batches
+     // (speculative verify) take the per-row sparse path.
+-    for (int64_t nb : { 1, 2, 3, 4, 8, 9 }) {
++    for (int64_t nb : { 1, 2, 3, 4, 8, 9, 64, 512 }) {
+         for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 1, 2, 3}, true, true, 2048));
+         }
+@@ -12859,6 +12859,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     }
+ 
+ 
++    // GLM-5.3-Flash routed experts (288 experts, top 8): gate/up 4096 -> 2048, down 2048 -> 4096, prefill batch sizes
++    for (ggml_type type_a : { GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S }) {
++        for (int bs : { 1, 512, 768, 1024, 2048, 4096 }) {
++            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 288, 8, false, 2048, bs, 4096));
++            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 288, 8, false, 4096, bs, 2048));
++        }
++    }
++
+     return test_cases;
+ }
+ 
+-- 
+2.43.0
+

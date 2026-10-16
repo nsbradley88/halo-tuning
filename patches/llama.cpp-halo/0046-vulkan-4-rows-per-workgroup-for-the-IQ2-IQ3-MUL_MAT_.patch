@@ -1,0 +1,40 @@
+From dbb030fb837be874fc49ef160c386e916bcdf165 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 20:59:24 +0000
+Subject: [PATCH 46/46] vulkan: 4 rows per workgroup for the IQ2/IQ3 MUL_MAT_ID
+ MMVQ
+
+test-backend-ops perf at the MiMo-V2.6-Flash / GLM-5.3-Flash expert shapes (256 / 288 experts, 8 used, random
+weight bytes, ids re-drawn per run), Radeon 8060S, us per op at 1 / 3 / 5 tokens, gate-up 2048x4096 and down 4096x2048:
+  iq2_xxs float 88/92, 302/320, 508/511 -> MMVQ rows 4: 65/70, 232/234, 371/375
+  iq3_xxs float 97/98, 343/359, 576/582 -> 72/76, 299/307, 504/518
+  iq2_xs  float 90/94, 303/308, 489/505 -> 71/73, 237/255, 391/408
+  iq2_s   float 92/100, 309/334, 522/569 -> 69/78, 259/287, 434/478
+  iq3_s   float 97/101, 365/367, 609/624 -> 85/89, 358/353, 592/601
+(rows 1 was worse than the float path for the iq2_s down matrix: 446 vs 334 at 3 tokens.)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 28091870e..431e21feb 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -2952,8 +2952,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         sscanf(e, "%u%*c%u", &iq3_rows_1, &iq3_rows_5);
+     }
+     auto const &rm_iq3_n = [&](uint32_t rows, uint32_t i) { GGML_UNUSED(rows); return i >= 4 ? iq3_rows_5 : iq3_rows_1; };
+-    // IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S MUL_MAT_ID MMVQ: rows per workgroup (env GGML_VK_IQ_ID_ROWS)
+-    uint32_t iq_id_rows = 1;
++    // IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S MUL_MAT_ID MMVQ: rows per workgroup (env GGML_VK_IQ_ID_ROWS).
++    // Radeon 8060S, 256-288 experts, 2048x4096 / 4096x2048, 5 tokens, us (rows 1 / 2 / 4, float path):
++    // iq2_xxs 414 / 374 / 371 (508), iq2_xs 450 / 426 / 391 (489), iq2_s down 738 / 539 / 478 (569)
++    uint32_t iq_id_rows = 4;
+     if (const char * e = getenv("GGML_VK_IQ_ID_ROWS")) {
+         iq_id_rows = std::max(1, atoi(e));
+     }
+-- 
+2.43.0
+

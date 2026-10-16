@@ -1,0 +1,344 @@
+From a2c0d5cfe4cf436624f48693536f0f365e4572ea Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 05:41:18 +0000
+Subject: [PATCH 12/46] vulkan: flat grouped-query fold for few-token flash
+ attention (speculative verify at depth)
+
+The decode GQA fold runs one coopmat1 workgroup per query token (gqa_ratio rows of a 16-row tile), so a verify
+batch of N tokens reads K/V N times and fills 6 of 16 rows for 24/4 heads. For 2..8 tokens the coopmat1 row
+tiles now run over the flattened (token, query head) rows of one KV head (GQA_FLAT_BIT): row R -> token
+R / gqa_ratio, head R % gqa_ratio, per-row Q / mask / output addressing. Exact (same per-row math; split counts
+change, so the last bits can differ). Knob GGML_VK_FA_GQA_FLAT=0 (off) / <n> (max tokens, default 8).
+
+Qwen3.8-27B (24/4 heads, hd 256, f16 cache) on Radeon 8060S, KV 32K, in the model: 16 FA calls of an 8-token
+DFlash2 verify 42.9 -> 17.7 ms, 5-token MTP verify 23.9 -> 13.0 ms. test-backend-ops: verify-shape eval and
+perf cases (2..16 tokens, cache layout, q8_0, sinks, ALiBi, other GQA ratios).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 35 +++++++++++-
+ .../vulkan-shaders/flash_attn_base.glsl       | 44 ++++++++++++++-
+ .../vulkan-shaders/flash_attn_cm1.comp        | 56 +++++++++----------
+ tests/test-backend-ops.cpp                    | 27 +++++++++
+ 4 files changed, 130 insertions(+), 32 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index fb2c88df3..7442310d7 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -8195,7 +8195,29 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
+     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
+ 
+-    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
++    // Flat grouped-query fold for few-token batches (speculative verify): one coopmat1 row tile covers the
++    // flattened (token, query head) rows of a KV head (GQA_FLAT_BIT in flash_attn_base.glsl), so the tokens share
++    // one pass over K/V. The per-token fold below runs one workgroup per token and reads K/V once per token, which
++    // dominates at depth: Qwen3.8-27B (24/4 heads, hd 256, KV 32K, Radeon 8060S) 2.7 ms per layer at 8 tokens vs
++    // 0.65 ms at one token. GGML_VK_FA_GQA_FLAT=0 disables, =<n> sets the largest token count (default 8;
++    // above that the KV-slice order of the unfolded path is as fast).
++    static const uint32_t gqa_flat_max_tokens = [] {
++        const char * e = getenv("GGML_VK_FA_GQA_FLAT");
++        return e ? (uint32_t) std::max(0, atoi(e)) : 8u;
++    }();
++    bool gqa_flat = false;
++    if (N >= 2 && N <= gqa_flat_max_tokens && qk_ratio > 1 &&
++        qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1 && neq3 == 1 &&
++        (!mask || nem1 >= N) && !ctx->device->coopmat2) {
++        const vk_fa_tuning_params tp_flat = get_fa_tuning_params(ctx->device, HSK, HSV, N * qk_ratio, KV, k_type_eff, v_type_eff, f32acc);
++        gqa_flat = tp_flat.path == FA_COOPMAT1;
++    }
++
++    if (gqa_flat) {
++        gqa_ratio = qk_ratio;
++        N = N * qk_ratio;
++        workgroups_y /= gqa_ratio;
++    } else if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
+         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
+         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
+         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
+@@ -8236,7 +8258,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+                             (tuning_params.path != FA_COOPMAT2 || (sparse_gather_aligned(k) && sparse_gather_aligned(v))) &&
+                             nem0 == KV &&
+                             (int64_t)KV >= std::max<int64_t>(4096, min_ratio * (int64_t)n_kv_max) &&
+-                            (gqa_ratio > 1 || (tuning_params.path == FA_SCALAR && N == 1));
++                            !gqa_flat && (gqa_ratio > 1 || (tuning_params.path == FA_SCALAR && N == 1));
+ 
+     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
+     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
+@@ -8271,7 +8293,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+     }
+ 
+     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
+-    bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
++    bool use_mask_opt = mask && !use_sparse && !gqa_flat && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
+                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
+     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
+                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+@@ -8359,6 +8381,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+             const char * e = getenv("GGML_VK_FA_KV_SLICE");
+             return e ? std::max(0, atoi(e)) : -1;
+         }();
++    if (gqa_flat) {
++        GGML_ASSERT(tuning_params.path == FA_COOPMAT1);
++        workgroups_x = Tr; // row tiles over the flattened rows
++    }
+         static const int kv_head_inner_env = [] {
+             const char * e = getenv("GGML_VK_FA_KV_HEAD_INNER");
+             return e ? (atoi(e) != 0 ? 1 : 0) : -1;
+@@ -8572,6 +8598,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+             (uint32_t)(mask->nb[3] / sizeof(ggml_fp16_t)),
+             (uint32_t)n_kv_max,
+         };
++    if (gqa_flat) {
++        mask_n_head_log2 |= 1u << 27; // GQA_FLAT_BIT
++    }
+ 
+         ggml_vk_dispatch_pipeline(ctx, subctx, sparse_compact_pipeline,
+                                   { mask_buf, sparse_buf }, sc_pc,
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl
+index 066d661aa..e2123efd6 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl
+@@ -83,6 +83,11 @@ layout (push_constant) uniform parameter {
+ // head, KV slices), so concurrent workgroups read all heads of the same tokens. For a KV cache that interleaves
+ // the heads per token this reads whole token rows instead of one head's part of each row.
+ #define KV_HEAD_INNER_BIT (1<<26)
++// Flat grouped-query fold (coopmat1, few query rows: decode and speculative verify batches): the row tiles of a
++// workgroup run over the flattened (token, query head) rows of one KV head, row R -> token R / gqa_ratio and query
++// head iq2 + R % gqa_ratio, so all tokens of a batch share one pass over K/V instead of one pass per token.
++// N is the number of flattened rows (tokens * gqa_ratio).
++#define GQA_FLAT_BIT (1<<27)
+ #define N_LOG2_MASK 0xFFFF
+ 
+ layout (binding = 4) readonly buffer S {float data_s[];};
+@@ -189,7 +194,12 @@ void init_indices()
+         }
+         split_outer_iq2 = kv_head * heads_per_kv + q_sub;
+     } else if (p.k_num > 1) {
+-        if (p.gqa_ratio > 1) {
++        if ((p.mask_n_head_log2 & GQA_FLAT_BIT) != 0) {
++            // row tiles and split_k share gl_WorkGroupID.x
++            gqa_iq1 = 0;
++            split_k_index = gl_WorkGroupID.x % p.k_num;
++            i = gl_WorkGroupID.x / p.k_num;
++        } else if (p.gqa_ratio > 1) {
+             i = 0;
+             // batch and split_k share gl_WorkGroupID.x
+             gqa_iq1 = gl_WorkGroupID.x / p.k_num;
+@@ -199,6 +209,10 @@ void init_indices()
+             split_k_index = gl_WorkGroupID.x % p.k_num;
+             i = gl_WorkGroupID.x / p.k_num;
+         }
++    } else if ((p.mask_n_head_log2 & GQA_FLAT_BIT) != 0) {
++        i = gl_WorkGroupID.x;
++        gqa_iq1 = 0;
++        split_k_index = 0;
+     } else if (p.gqa_ratio > 1) {
+         i = 0;
+         gqa_iq1 = gl_WorkGroupID.x;
+@@ -262,6 +276,34 @@ void init_indices()
+     }
+ }
+ 
++bool gqa_flat() {
++    return (p.mask_n_head_log2 & GQA_FLAT_BIT) != 0;
++}
++
++// Offset (in Q elements, from q_offset) of the tile-global row R.
++uint32_t q_row_offset(const uint32_t R) {
++    if (gqa_flat()) {
++        return (R / p.gqa_ratio) * p.nb01 + (R % p.gqa_ratio) * q_stride;
++    }
++    return R * q_stride;
++}
++
++// Offset (in mask elements, from m_offset) of the mask row of the tile-global row R.
++uint32_t m_row_offset(const uint32_t R) {
++    if (gqa_flat()) {
++        return min(R / p.gqa_ratio, p.nem1 - 1) * KV;
++    }
++    return R * m_stride;
++}
++
++// Grouped modes: the token (dst dim 2) and the query head offset from iq2 of the tile-global row R.
++uint32_t gqa_row_token(const uint32_t R) {
++    return gqa_flat() ? R / p.gqa_ratio : gqa_iq1;
++}
++uint32_t gqa_row_head(const uint32_t R) {
++    return gqa_flat() ? R % p.gqa_ratio : R;
++}
++
+ // Resolve a linear KV slot to a real column; false for inactive (sparse padding/-1, or dense OOB).
+ bool fa_kv_index(uint lin, out uint kv_col) {
+     if (USE_SPARSE) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
+index edb16ae7e..947fce7aa 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
+@@ -100,7 +100,7 @@ void main() {
+         uint32_t r = (idx + tid) / (HSK / 4);
+         if (r < Br && d < HSK / 4 &&
+             i * Br + r < N) {
+-            Qf[r * qstride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale);
++            Qf[r * qstride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + q_row_offset(i * Br + r) / 4 + d] * p.scale);
+         }
+     }
+     barrier();
+@@ -126,7 +126,7 @@ void main() {
+     if (p.max_bias > 0.0f) {
+         if (tid < Br) {
+             uint r = tid;
+-            slope[r] = perElemOpComputeSlope(r, col_tid, ACC_TYPE(0), iq2);
++            slope[r] = perElemOpComputeSlope(i * Br + r, col_tid, ACC_TYPE(0), iq2);
+         }
+     } else {
+         if (tid < Br) {
+@@ -189,25 +189,25 @@ void main() {
+                                 m = f16vec4(mv);
+                                 max_mask = max(max_mask, float(mv));
+                             } else if (!nem1_bounds_check || i * Br + r * 4 + 3 < p.nem1) {
+-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
+-                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
+-                                            data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + (j * Bc + c)],
+-                                            data_m[m_offset + (i * Br + r * 4 + 3) * m_stride + (j * Bc + c)]);
++                                m = f16vec4(data_m[m_offset + m_row_offset(i * Br + r * 4    ) + (j * Bc + c)],
++                                            data_m[m_offset + m_row_offset(i * Br + r * 4 + 1) + (j * Bc + c)],
++                                            data_m[m_offset + m_row_offset(i * Br + r * 4 + 2) + (j * Bc + c)],
++                                            data_m[m_offset + m_row_offset(i * Br + r * 4 + 3) + (j * Bc + c)]);
+                                 max_mask = max(max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2])), float(m[3]));
+                             } else if (i * Br + r * 4 + 2 < p.nem1) {
+-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
+-                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
+-                                            data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + (j * Bc + c)],
++                                m = f16vec4(data_m[m_offset + m_row_offset(i * Br + r * 4    ) + (j * Bc + c)],
++                                            data_m[m_offset + m_row_offset(i * Br + r * 4 + 1) + (j * Bc + c)],
++                                            data_m[m_offset + m_row_offset(i * Br + r * 4 + 2) + (j * Bc + c)],
+                                             0.0);
+                                 max_mask = max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2]));
+                             } else if (i * Br + r * 4 + 1 < p.nem1) {
+-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
+-                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
++                                m = f16vec4(data_m[m_offset + m_row_offset(i * Br + r * 4    ) + (j * Bc + c)],
++                                            data_m[m_offset + m_row_offset(i * Br + r * 4 + 1) + (j * Bc + c)],
+                                             0.0,
+                                             0.0);
+                                 max_mask = max(max(max_mask, float(m[0])), float(m[1]));
+                             } else if (i * Br + r * 4 < p.nem1) {
+-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
++                                m = f16vec4(data_m[m_offset + m_row_offset(i * Br + r * 4    ) + (j * Bc + c)],
+                                             0.0,
+                                             0.0,
+                                             0.0);
+@@ -563,25 +563,22 @@ void main() {
+     // division by L. Store the intermediate O value and per-row m and L values.
+     if (p.k_num > 1) {
+         if (p.gqa_ratio > 1) {
+-            // note: O and Q have swapped coord 1,2.
+-            uint32_t o_offset = HSV * p.ne1 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3)) / 4;
+-
++            // note: O and Q have swapped coord 1,2. i == 0 unless gqa_flat().
+             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+-                if (tile_row(r) < N) {
++                const uint32_t R = i * Br + tile_row(r);
++                if (R < N) {
++                    const uint32_t tok = gqa_row_token(R);
++                    const uint32_t h   = gqa_row_head(R);
++                    const uint32_t o_offset = HSV * p.ne1 * (split_k_index + p.k_num * (tok + p.ne2 * iq3)) / 4;
+                     [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
+                         const uint d = d0 + col_tid;
+                         if (d >= HSV/4) break;
+                         const uint d_local = d0 / threads_per_rowgroup;
+-                        gqaStore(tile_row(r), d, Of[r][d_local], o_offset, iq2, N);
++                        gqaStore(h, d, Of[r][d_local], o_offset, iq2, N);
+                     }
+-                }
+-            }
+-
+-            o_offset = HSV * p.ne1 * p.k_num * p.ne2 * p.ne3 + p.ne1 * 2 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3));
+-            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+-                if (tile_row(r) < N) {
+-                    perElemOpStoreCol0(tile_row(r), 0u, ACC_TYPE(Lf[r]), o_offset, iq2, N);
+-                    perElemOpStoreCol0(tile_row(r), 0u, ACC_TYPE(Mf[r]), o_offset + p.ne1, iq2, N);
++                    const uint32_t lm_offset = HSV * p.ne1 * p.k_num * p.ne2 * p.ne3 + p.ne1 * 2 * (split_k_index + p.k_num * (tok + p.ne2 * iq3));
++                    data_o[lm_offset + iq2 + h] = D_TYPE(Lf[r]);
++                    data_o[lm_offset + p.ne1 + iq2 + h] = D_TYPE(Mf[r]);
+                 }
+             }
+         } else {
+@@ -612,7 +609,7 @@ void main() {
+ 
+     if ((p.mask_n_head_log2 & SINK_ENABLE_BIT) != 0) {
+         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+-            float sink = perElemOpGetSink(tile_row(r), 0u, ACC_TYPE(0), iq2);
++            float sink = perElemOpGetSink(i * Br + tile_row(r), 0u, ACC_TYPE(0), iq2);
+ 
+             float ms = 1.0f;
+             float vs = 1.0f;
+@@ -650,13 +647,16 @@ void main() {
+     uint32_t o_offset = (gqa_iq1*p.ne1*HSV + iq3*p.ne2*p.ne1*HSV) / 4;
+ 
+     if (p.gqa_ratio > 1) {
++        // i == 0 unless gqa_flat()
+         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+-            if (tile_row(r) < N) {
++            const uint32_t R = i * Br + tile_row(r);
++            if (R < N) {
++                const uint32_t o_offset_r = (gqa_row_token(R)*p.ne1*HSV + iq3*p.ne2*p.ne1*HSV) / 4;
+                 [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
+                     const uint d = d0 + col_tid;
+                     if (d >= HSV / 4) break;
+                     const uint d_local = d0 / threads_per_rowgroup;
+-                    gqaStore(tile_row(r), d, Of[r][d_local], o_offset, iq2, N);
++                    gqaStore(gqa_row_head(R), d, Of[r][d_local], o_offset_r, iq2, N);
+                 }
+             }
+         }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f29c80fb0..5ef10b025 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11947,6 +11947,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {8, 1}, 4096,  24, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false));
+ 
+     // Sparse mask hint: supported decode/prefill layouts and dense fallbacks.
++    // Qwen3.8-27B speculative verify batches (2..16 tokens, flat grouped-query fold in Vulkan coopmat1 FA), KV cache
++    // layout and contiguous, ragged KV, q8_0 cache, sinks / ALiBi, other GQA ratios and head sizes
++    for (int kv : { 256, 1000, 4113 }) {
++        for (int nb : { 2, 3, 5, 8, 9, 13, 16 }) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        }
++    }
++    for (int nb : { 4, 8, 16 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, true, false, 8, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_DEFAULT, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1000, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {16, 1}, 777, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 2}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    }
++
+     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 2}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  768));
+     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
+@@ -12573,6 +12593,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     }
+ 
+     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
++    // Qwen3.8-27B speculative verify batches at depth (KV cache layout)
++    for (int kv : { 2048, 32768 }) {
++        for (int nb : { 1, 2, 4, 5, 8, 12, 16 }) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
++        }
++    }
++
+         for (int hs : { 64, 128, 256, 512, 576, }) {
+             const int  hsv    = hs == 576 ? 512 : hs;
+             const bool v_view = hs == 576;
+-- 
+2.43.0
+

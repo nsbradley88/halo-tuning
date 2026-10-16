@@ -1,0 +1,50 @@
+From c623207524a3eaabe1224fe4cd80fec13c1375d0 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 09:09:04 +0000
+Subject: [PATCH 32/46] glm5-next: repeat a shared -inf row into the indexer
+ scatter mask
+
+The in-place FILL of a new [1, n_kv + n_sel, n_tokens] tensor made it a graph
+leaf, and ggml-alloc keeps leaves for the whole graph: 11 of them at prefill
+(n_tokens 1024, n_kv up to 64K). Fill one [n_kv + n_sel] row per graph and
+REPEAT it per layer (a normal node), as before, but without the per-layer FILL.
+Projection of the production config: 115993 MiB (prod build: 116046 MiB).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/models/glm5-next.cpp | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src/models/glm5-next.cpp b/src/models/glm5-next.cpp
+index 71703ec38..71b9c863b 100644
+--- a/src/models/glm5-next.cpp
++++ b/src/models/glm5-next.cpp
+@@ -327,6 +327,7 @@ public:
+     ggml_tensor * new_pool_rep  = nullptr; // I64     [n_new]          cell to write each new pooled key into
+ 
+     // derived from the inputs once per graph and shared by all indexer layers (see build_kpool_select)
++    ggml_tensor * sel_neg_inf_row = nullptr; // [n_kv + n_sel] -inf, repeated into each layer's scatter mask
+     ggml_tensor * sel_zeros     = nullptr; // F32     [1, n_sel, n_tokens] scatter values
+     ggml_tensor * sel_live      = nullptr; // F32     [n_sel, n_tokens]    1 for live selection slots, 0 for dead ones
+     ggml_tensor * sel_dead_dump = nullptr; // F32     [n_sel, n_tokens]    dump row n_kv + slot for dead slots, 0 for live ones
+@@ -1098,9 +1099,14 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
+ 
+     ggml_build_forward_expand(gf, sel_idx);
+ 
+-    // filled in place: the scatter below writes into it, so each layer needs its own
+-    ggml_tensor * mask_all = ggml_new_tensor_3d(ctx0, kq_mask->type, 1, n_kv + n_sel, n_tokens);
+-    mask_all = ggml_fill_inplace(ctx0, mask_all, -INFINITY);
++    // the scatter below writes into the mask, so each layer repeats its own copy of a shared -inf row
++    // (a full-size filled leaf would stay allocated for the whole graph: 11 x [n_kv, n_tokens] at prefill)
++    if (inp_kpool->sel_neg_inf_row == nullptr) {
++        ggml_tensor * row = ggml_new_tensor_4d(ctx0, kq_mask->type, n_kv + n_sel, 1, 1, 1);
++        inp_kpool->sel_neg_inf_row = ggml_fill(ctx0, row, -INFINITY);
++    }
++    ggml_tensor * mask_all = ggml_repeat_4d(ctx0, inp_kpool->sel_neg_inf_row, n_kv + n_sel, n_tokens, 1, 1);
++    mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + n_sel, n_tokens);
+ 
+     // Live slots (visible pools, real tail cells) address disjoint cells. Each dead slot writes its own dump row
+     // n_kv + slot, so the scatter indices of a token are unique: idx = live*idx + (1 - live)*dump, live = exp(mask).
+-- 
+2.43.0
+

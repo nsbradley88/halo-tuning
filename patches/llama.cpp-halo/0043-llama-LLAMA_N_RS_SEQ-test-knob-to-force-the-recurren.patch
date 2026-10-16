@@ -1,0 +1,32 @@
+From 0cddcd2935466e107f7a362f8a12a338dc6a70bb Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 18:32:36 +0000
+Subject: [PATCH 43/46] llama: LLAMA_N_RS_SEQ test knob to force the recurrent
+ rollback depth
+
+Lets llama-perplexity run with the MTP server's recurrent state layout (state read
+through ids), so the small-ubatch KDA/mHC paths can be checked with KLD at -ub 8.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 91d7b0b42..4c09f9ecc 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -197,6 +197,10 @@ llama_context::llama_context(
+     }
+ 
+     cparams.n_rs_seq = params.n_rs_seq;
++    // test knob: LLAMA_N_RS_SEQ forces the recurrent rollback depth (e.g. llama-perplexity with the MTP server's state layout)
++    if (const char * env = getenv("LLAMA_N_RS_SEQ")) {
++        cparams.n_rs_seq = (uint32_t) atoi(env);
++    }
+     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
+         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
+                         __func__, cparams.n_rs_seq);
+-- 
+2.43.0
+

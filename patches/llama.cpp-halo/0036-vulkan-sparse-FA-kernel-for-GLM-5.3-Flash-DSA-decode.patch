@@ -1,0 +1,704 @@
+From b837a5d3028f372af67dea430e31a007c007708e Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 10:52:17 +0000
+Subject: [PATCH 36/46] vulkan: sparse FA kernel for GLM-5.3-Flash DSA (decode,
+ verify and prefill)
+
+The sparse path ran the coopmat1 FA shader (Br 16 heads, Bc 64) over the gathered rows. With
+HSK = HSV = 512 it is slow here even without the gather (dense over 2048 rows: 54 us at one
+token), and the gather adds per-step index loads and staging barriers: ~95 us per token at
+any depth, so 298 us per layer for the 3-token MTP verify at 32K. More splits did not help.
+
+flash_attn_sparse_dec.comp handles sparse FA with every head on one f16 KV head of 512 (the
+MLA latent): a workgroup of 512 invocations takes 32 heads of one token over a slice of the
+compacted position list. It preloads the slice, keeps its share of the scaled query heads in
+registers, gathers each block of 32 rows with 16-byte loads one block ahead, and shares the
+staged rows between S = QK^T and P*V (V is a view of K; a separate V is read directly).
+S, softmax and O are fp32 with f16 Q and P as in the other FA paths, using v_dot2_f32_f16
+where available, wave32 where the subgroup size is selectable. Splits target one round of
+workgroups and go through the split_k reduce; a single split (prefill) writes dst directly.
+GGML_VK_FA_SPARSE_DEC_DISABLE turns it off, GGML_VK_FA_SPARSE_DEC_MAX_N limits the batch,
+GGML_VK_FA_SPARSE_DEC_WGS overrides the workgroup target.
+
+The compaction pass issues 16 independent mask loads per lane per step instead of one, so a
+row costs a few memory round trips instead of one per 64 positions.
+
+test-backend-ops perf, Radeon 8060S, 64 heads, 2048 selected (old -> new):
+  8K   n=1 107 -> 46 us, n=3 281 -> 107 us
+  32K  n=1 116 -> 55 us, n=3 298 -> 119 us
+  64K  n=1 125 -> 65 us, n=3 313 -> 136 us
+  32K  prefill ubatch 128: 10.3 -> 4.3 ms, 512: 41.8 -> 15.3 ms
+Compaction plus split reduce is ~14 us of the 32K n=1 time (25 us at 64K).
+
+test-backend-ops: sparse cases with a separate V, 32 heads, a 1000 and a 2051 (GLM) budget,
+an 8192 budget at 64K, prefill batches; GLM-shaped perf cases incl. a dense 2048 reference.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ggml-vulkan/ggml-vulkan-push-constants.h  |  14 +
+ ggml/src/ggml-vulkan/ggml-vulkan-types.h      |   1 +
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 141 ++++++++
+ .../flash_attn_sparse_compact.comp            |  40 ++-
+ .../vulkan-shaders/flash_attn_sparse_dec.comp | 320 ++++++++++++++++++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |   2 +
+ tests/test-backend-ops.cpp                    |  26 ++
+ 7 files changed, 532 insertions(+), 12 deletions(-)
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_sparse_dec.comp
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+index 0074009f4..b2ff9646b 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+@@ -929,6 +929,20 @@ struct vk_op_flash_attn_decode_gqa_push_constants {
+     float    scale;
+ };
+ 
++struct vk_op_flash_attn_sparse_dec_push_constants {
++    uint32_t N;
++    uint32_t n_kv_max;
++    uint32_t k_num;
++    uint32_t per_blocks;
++    uint32_t q_nb1;
++    uint32_t q_nb2;
++    uint32_t k_stride;
++    uint32_t v_stride;
++    uint32_t m_stride;
++    uint32_t ne1;
++    float scale;
++};
++
+ struct vk_op_flash_attn_sparse_compact_push_constants {
+     uint32_t KV;
+     uint32_t nem1;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index fe80adc8a..abb3120a2 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -999,6 +999,7 @@ struct vk_device_struct {
+ 
+     vk_pipeline pipeline_fa_sparse_compact;
+     vk_pipeline pipeline_fa_sparse_compact_subgroup;
++    vk_pipeline pipeline_fa_sparse_dec[2]; // [V is a view of K]
+     bool fa_sparse_compact_use_subgroups;
+ 
+     vk_pipeline pipeline_flash_attn_split_k_reduce;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 9103d3f9d..c9827281d 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -3319,6 +3319,23 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         } else {
+             ggml_vk_create_pipeline(device, device->pipeline_fa_sparse_compact, "fa_sparse_compact", fa_sparse_compact_len, fa_sparse_compact_data, "main", 2, sizeof(vk_op_flash_attn_sparse_compact_push_constants), {1, 1, 1}, {compact_max}, 1, true);
+         }
++
++        // sparse FA with every head on one KV head (GLM-5.3-Flash DSA), see flash_attn_sparse_dec.comp: 512
++        // invocations, ~51 KB of shared memory, lane shuffles within groups of 16. Wave32 where the size is
++        // selectable (fewer cycles per instruction than wave64 for this latency-bound loop).
++        if (device->fp16 && device->subgroup_shuffle && device->subgroup_size >= 16 &&
++            device->properties.limits.maxComputeWorkGroupInvocations >= 512 &&
++            device->properties.limits.maxComputeSharedMemorySize >= 52 * 1024) {
++            const uint32_t sg = device->subgroup_size_control && device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32 ? 32 : 0;
++            for (uint32_t v_same = 0; v_same < 2; ++v_same) {
++                const char * name = v_same ? "fa_sparse_dec_vk" : "fa_sparse_dec";
++                if (device->dot2_f16) {
++                    ggml_vk_create_pipeline(device, device->pipeline_fa_sparse_dec[v_same], name, fa_sparse_dec_dot2_len, fa_sparse_dec_dot2_data, "main", 6, sizeof(vk_op_flash_attn_sparse_dec_push_constants), {1, 1, 1}, {v_same}, 1, true, false, sg);
++                } else {
++                    ggml_vk_create_pipeline(device, device->pipeline_fa_sparse_dec[v_same], name, fa_sparse_dec_len, fa_sparse_dec_data, "main", 6, sizeof(vk_op_flash_attn_sparse_dec_push_constants), {1, 1, 1}, {v_same}, 1, true, false, sg);
++                }
++            }
++        }
+     }
+ 
+     if (device->subgroup_clustered && device->subgroup_require_full_support) {
+@@ -8285,6 +8302,123 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
+     return supported;
+ }
+ 
++static bool ggml_vk_flash_attn_sparse_dec(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
++    static const bool disabled = getenv("GGML_VK_FA_SPARSE_DEC_DISABLE") != nullptr || getenv("GGML_VK_FA_SPARSE_DISABLE") != nullptr;
++    // GGML_VK_FA_SPARSE_DEC_MAX_N: largest batch that takes this path (default: any)
++    static const uint32_t max_n = getenv("GGML_VK_FA_SPARSE_DEC_MAX_N") ? (uint32_t)atoi(getenv("GGML_VK_FA_SPARSE_DEC_MAX_N")) : UINT32_MAX;
++    constexpr uint32_t HG = 32, BC = 32, D = 512, MAX_SLOTS = 2304;
++
++    if (disabled || !mask || sinks || ctx->device->pipeline_fa_sparse_dec[0] == nullptr) {
++        return false;
++    }
++    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
++    float scale, max_bias, logit_softcap;
++    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
++    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
++
++    const uint32_t N  = q->ne[1];
++    const uint32_t H  = q->ne[2];
++    const uint32_t KV = k->ne[1];
++
++    const bool v_same = v->data == k->data && v->nb[1] == k->nb[1];
++    if (n_kv_max <= 0 || max_bias != 0.0f || logit_softcap != 0.0f ||
++        q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_F16 ||
++        k->ne[0] != D || v->ne[0] != D || N == 0 || N > max_n || H % HG != 0 ||
++        k->ne[2] != 1 || v->ne[2] != 1 || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
++        mask->ne[0] != KV || mask->ne[1] < N || mask->ne[2] != 1 || mask->ne[3] != 1 ||
++        (int64_t)KV < std::max<int64_t>(4096, 2 * (int64_t)n_kv_max) ||
++        q->nb[1] % 16 != 0 || q->nb[2] % 16 != 0 || k->nb[1] % 16 != 0 || v->nb[1] % 8 != 0 || mask->nb[1] % 2 != 0 ||
++        !ggml_is_contiguous(dst) || dst->ne[1] != H || dst->ne[2] != N) {
++        return false;
++    }
++
++    // splits: one round of workgroups, about one per shader core (a workgroup takes ~51 KB of shared memory and
++    // 512 invocations, so only one fits per core), at most MAX_SLOTS index slots per workgroup. A single split
++    // writes dst directly; the split partials of large batches would not fit the split_k scratch.
++    // GGML_VK_FA_SPARSE_DEC_WGS overrides the target workgroup count.
++    static const uint32_t target_wgs_env = getenv("GGML_VK_FA_SPARSE_DEC_WGS") ? (uint32_t)atoi(getenv("GGML_VK_FA_SPARSE_DEC_WGS")) : 0;
++    const uint32_t target_wgs = target_wgs_env ? target_wgs_env : (ctx->device->shader_core_count ? ctx->device->shader_core_count : 16);
++    const uint32_t total_blocks = CEIL_DIV((uint32_t)n_kv_max, BC);
++    const uint32_t base_wgs = (H / HG) * N;
++    uint32_t k_num = std::max(std::max(1u, target_wgs / base_wgs), CEIL_DIV((uint32_t)n_kv_max, MAX_SLOTS));
++    k_num = std::min(k_num, total_blocks);
++    uint32_t per_blocks = CEIL_DIV(total_blocks, k_num);
++    k_num = CEIL_DIV(total_blocks, per_blocks);
++    if (k_num > 1 && (uint64_t)(D * H * sizeof(float) + H * sizeof(float) * 2) * k_num * N > 64ull * 1024 * 1024) {
++        k_num = 1;
++        per_blocks = total_blocks;
++    }
++    if (per_blocks * BC > MAX_SLOTS) {
++        return false;
++    }
++
++    vk_pipeline pipeline = ctx->device->pipeline_fa_sparse_dec[v_same ? 1 : 0];
++    vk_pipeline compact = ctx->device->fa_sparse_compact_use_subgroups ? ctx->device->pipeline_fa_sparse_compact_subgroup
++                                                                       : ctx->device->pipeline_fa_sparse_compact;
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++    ggml_pipeline_request_descriptor_sets(ctx, compact, 1);
++    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
++
++    const uint32_t nem1 = mask->ne[1];
++    const uint64_t sparse_idx_size = sizeof(int32_t) * (uint64_t)n_kv_max * nem1;
++    if (ctx->prealloc_size_y < sparse_idx_size) {
++        ctx->prealloc_size_y = sparse_idx_size;
++        ggml_vk_preallocate_buffers(ctx, subctx);
++    }
++    const uint64_t split_k_size = k_num > 1 ? (uint64_t)(D * H * sizeof(float) + H * sizeof(float) * 2) * k_num * N : 0;
++    if (ctx->prealloc_size_split_k < split_k_size) {
++        ctx->prealloc_size_split_k = split_k_size;
++        ggml_vk_preallocate_buffers(ctx, subctx);
++    }
++    if (ctx->prealloc_y_need_sync || ctx->prealloc_split_k_need_sync) {
++        ggml_vk_sync_buffers(ctx, subctx);
++    }
++
++    vk_subbuffer q_buf    = ggml_vk_tensor_subbuffer(ctx, q);
++    vk_subbuffer k_buf    = ggml_vk_tensor_subbuffer(ctx, k);
++    vk_subbuffer v_buf    = v_same ? k_buf : ggml_vk_tensor_subbuffer(ctx, v);
++    vk_subbuffer mask_buf = ggml_vk_tensor_subbuffer(ctx, mask);
++    vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
++    vk_subbuffer idx_buf  = ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0);
++    vk_subbuffer part_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
++    // the index list overwrites a matmul input converted into prealloc_y
++    ctx->prealloc_y_last_pipeline_used = nullptr;
++    ctx->prealloc_y_last_tensor_used = nullptr;
++
++    const vk_op_flash_attn_sparse_compact_push_constants sc_pc = {
++        KV, nem1, 1,
++        (uint32_t)(mask->nb[1] / sizeof(ggml_fp16_t)),
++        (uint32_t)(mask->nb[2] / sizeof(ggml_fp16_t)),
++        (uint32_t)(mask->nb[3] / sizeof(ggml_fp16_t)),
++        (uint32_t)n_kv_max,
++    };
++    ggml_vk_dispatch_pipeline(ctx, subctx, compact, { mask_buf, idx_buf }, sc_pc, { nem1, 1, 1 });
++    ggml_vk_sync_buffers(ctx, subctx);
++
++    const vk_op_flash_attn_sparse_dec_push_constants pc = {
++        N, (uint32_t)n_kv_max, k_num, per_blocks,
++        (uint32_t)(q->nb[1] / sizeof(float)), (uint32_t)(q->nb[2] / sizeof(float)),
++        (uint32_t)(k->nb[1] / sizeof(ggml_fp16_t)), (uint32_t)(v->nb[1] / sizeof(ggml_fp16_t)),
++        (uint32_t)(mask->nb[1] / sizeof(ggml_fp16_t)),
++        H, scale,
++    };
++    if (k_num == 1) {
++        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, v_buf, mask_buf, idx_buf, dst_buf }, pc, { H / HG, N, 1 });
++    } else {
++        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, v_buf, mask_buf, idx_buf, part_buf }, pc, { H / HG, N, k_num });
++        ggml_vk_sync_buffers(ctx, subctx);
++
++        const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { D, H, N, 1, k_num, 0 };
++        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
++                                  { part_buf, q_buf, dst_buf }, pc2, { H, D, N });
++        ctx->prealloc_split_k_need_sync = true;
++    }
++
++    ctx->prealloc_y_need_sync = true;
++    return true;
++}
++
+ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
+     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
+@@ -8344,6 +8478,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+ 
+     const bool f32acc = !ctx->device->fp16 || dst->op_params[3] == GGML_PREC_F32 || k->type == GGML_TYPE_BF16;
+ 
++    // Sparse FA with every head on one f16 KV head of 512 and a sparse mask hint (GLM-5.3-Flash DSA): compact the
++    // selected positions, run flash_attn_sparse_dec.comp over (32 heads, token, split) and merge the splits with
++    // the split_k reduce. GGML_VK_FA_SPARSE_DEC_DISABLE turns it off.
++    if (ggml_vk_flash_attn_sparse_dec(ctx, subctx, q, k, v, mask, sinks, dst)) {
++        return;
++    }
++
+     // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride
+     auto is_dense_kv_cache = [](const ggml_tensor * t) {
+         return t->nb[0] == ggml_type_size(t->type) &&
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_sparse_compact.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_sparse_compact.comp
+index 50eeebece..1f63c7b9a 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_sparse_compact.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_sparse_compact.comp
+@@ -12,6 +12,8 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ layout(constant_id = 0) const uint BLOCK_SIZE = 128;
+ layout(constant_id = 1) const uint NUM_SUBGROUPS = 1;
+ 
++#define UNROLL 16
++
+ layout (binding = 0) readonly buffer M {float16_t data_m[];};
+ layout (binding = 1) writeonly buffer I {int32_t data_i[];};
+ 
+@@ -57,12 +59,20 @@ void main() {
+     const uint seg  = (p.KV + gl_NumSubgroups - 1) / gl_NumSubgroups;
+     const uint seg_begin = min(sg * seg, p.KV);
+     const uint seg_end   = min(seg_begin + seg, p.KV);
++    const uint step      = gl_SubgroupSize * UNROLL;
+ 
+-    // Lanes read consecutive positions, so each step is one coalesced load.
++    // Lanes read consecutive positions, so each load is coalesced. UNROLL independent loads per lane are
++    // issued before any of them is used, so a pass costs about seg / step memory latencies, not seg / subgroup.
+     uint count = 0;
+-    for (uint k0 = seg_begin; k0 < seg_end; k0 += gl_SubgroupSize) {
+-        const uint k = k0 + lane;
+-        count += subgroupBallotBitCount(subgroupBallot(k < seg_end && is_selected(m_base + k)));
++    for (uint k0 = seg_begin; k0 < seg_end; k0 += step) {
++        bool sel[UNROLL];
++        [[unroll]] for (uint u = 0; u < UNROLL; ++u) {
++            const uint k = k0 + u * gl_SubgroupSize + lane;
++            sel[u] = k < seg_end && is_selected(m_base + k);
++        }
++        [[unroll]] for (uint u = 0; u < UNROLL; ++u) {
++            count += subgroupBallotBitCount(subgroupBallot(sel[u]));
++        }
+     }
+     if (subgroupElect()) {
+         counts_sh[sg] = count;
+@@ -76,15 +86,21 @@ void main() {
+         total += counts_sh[s];
+     }
+ 
+-    for (uint k0 = seg_begin; k0 < seg_end && slot < p.n_kv_max; k0 += gl_SubgroupSize) {
+-        const uint k = k0 + lane;
+-        const bool selected = k < seg_end && is_selected(m_base + k);
+-        const uvec4 ballot = subgroupBallot(selected);
+-        const uint pos = slot + subgroupBallotExclusiveBitCount(ballot);
+-        if (selected && pos < p.n_kv_max) {
+-            data_i[out_base + pos] = int32_t(k);
++    for (uint k0 = seg_begin; k0 < seg_end && slot < p.n_kv_max; k0 += step) {
++        bool sel[UNROLL];
++        [[unroll]] for (uint u = 0; u < UNROLL; ++u) {
++            const uint k = k0 + u * gl_SubgroupSize + lane;
++            sel[u] = k < seg_end && is_selected(m_base + k);
++        }
++        [[unroll]] for (uint u = 0; u < UNROLL; ++u) {
++            const uint k = k0 + u * gl_SubgroupSize + lane;
++            const uvec4 ballot = subgroupBallot(sel[u]);
++            const uint pos = slot + subgroupBallotExclusiveBitCount(ballot);
++            if (sel[u] && pos < p.n_kv_max) {
++                data_i[out_base + pos] = int32_t(k);
++            }
++            slot += subgroupBallotBitCount(ballot);
+         }
+-        slot += subgroupBallotBitCount(ballot);
+     }
+ #else
+     const uint run   = (p.KV + BLOCK_SIZE - 1) / BLOCK_SIZE;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_sparse_dec.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_sparse_dec.comp
+new file mode 100644
+index 000000000..39f166058
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_sparse_dec.comp
+@@ -0,0 +1,320 @@
++#version 450
++
++#extension GL_EXT_control_flow_attributes : enable
++#extension GL_EXT_shader_16bit_storage : require
++#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
++#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
++#extension GL_KHR_shader_subgroup_basic : require
++#extension GL_KHR_shader_subgroup_shuffle : require
++
++#if defined(DOT2_F16)
++#extension GL_EXT_spirv_intrinsics : require
++spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"], capabilities = [6912], id = 6916)
++float v_dot2_f32_f16(f16vec2 a, f16vec2 b, float acc);
++float dot2_acc(f16vec2 a, f16vec2 b, float acc) {
++    return v_dot2_f32_f16(a, b, acc);
++}
++#else
++float dot2_acc(f16vec2 a, f16vec2 b, float acc) {
++    return fma(float(a.x), float(b.x), fma(float(a.y), float(b.y), acc));
++}
++#endif
++
++float dot4_acc(f16vec4 a, f16vec4 b, float acc) {
++    return dot2_acc(a.zw, b.zw, dot2_acc(a.xy, b.xy, acc));
++}
++
++// Sparse flash attention for few query tokens per head with every query head on one KV head (GLM-5.3-Flash
++// DSA: MLA latent 512, 64 heads, 2048 selected positions per token). The selected positions come from the
++// compaction pass (flash_attn_sparse_compact.comp); with several splits the partial results go through the
++// split_k reduce, a single split writes dst itself.
++//
++// Workgroup (group of HG heads, token, split): it preloads its slice of the index list into shared memory,
++// keeps the scaled query heads in registers as f16 (as the other FA paths do) and walks the slice in blocks of
++// BC positions. Each block of K rows is gathered with 16-byte loads into registers one block ahead, so the
++// gather latency overlaps the math of the previous block, and all HG heads share the staged block.
++// With V a view of K, P*V reads the staged rows too. S, softmax and O are fp32, P is f16 (as in the other FA
++// paths) so P*V runs on 2-wide f16 dot products with fp32 accumulation.
++
++layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++
++layout(constant_id = 0) const uint V_SAME = 1;       // V rows are the K rows
++
++// sizes are plain constants (not specialization constants) so every array has a literal size
++#define D         512u  // HSK == HSV
++#define MAX_SLOTS 2304u // largest index slice per workgroup (GLM: 2048 + 3 tail slots, rounded up to blocks)
++#define WG  512u
++#define HG  32u    // heads per workgroup
++#define BC  32u    // positions per block
++#define DS  8u     // lanes that split the dims of one dot product in S = Q K^T
++#define KPT 8u     // positions per invocation in S = Q K^T (two heads each)
++
++#define D4  (D / 4u)
++#define D8  (D / 8u)
++#define KS4 (D4 + 8u)  // padded row stride of the staged K block, in f16vec4
++#define RPI (WG / D8)  // rows per gather iteration
++#define NIT (BC / RPI) // gather iterations per block
++#define PVH (WG / (D / 4u)) // head groups in P*V: an invocation owns 4 dims of HPV heads
++#define HPV (HG / PVH)
++
++layout(binding = 0) readonly buffer Q {vec4 data_q4[];};
++layout(binding = 1) readonly buffer K {uvec4 data_k8[];};
++layout(binding = 2) readonly buffer V {f16vec4 data_v4[];};
++layout(binding = 3) readonly buffer M {float16_t data_m[];};
++layout(binding = 4) readonly buffer I {int data_i[];};
++layout(binding = 5) writeonly buffer O {float data_o[];};
++layout(binding = 5) writeonly buffer O4 {vec4 data_o4[];};
++
++layout(push_constant) uniform parameter {
++    uint N;          // query tokens
++    uint n_kv_max;   // index slots per token
++    uint k_num;      // splits
++    uint per_blocks; // blocks per split
++    uint q_nb1;      // token stride of q, floats
++    uint q_nb2;      // head stride of q, floats
++    uint k_stride;   // row stride of K, f16
++    uint v_stride;   // row stride of V, f16
++    uint m_stride;   // row stride of the mask, f16
++    uint ne1;        // number of heads
++    float scale;
++} p;
++
++shared f16vec4  ksh[BC * KS4];
++shared float    ssh[BC * HG];        // S, [position][head]
++shared uvec4    psh[BC / 2 * HG / 4]; // P as packed f16 pairs, [position pair][head]
++shared float    msh[BC];
++shared float    esh[HG];
++shared int      idxsh[MAX_SLOTS];
++
++const float NEG = uintBitsToFloat(0xFEFFFFFF); // -FLT_MAX/2
++
++void main() {
++    // head group fastest, then token: the workgroups that gather the same (or, for neighbouring tokens, mostly
++    // the same) K rows run next to each other and share them through the cache
++    const uint tid   = gl_LocalInvocationIndex;
++    const uint h0    = gl_WorkGroupID.x * HG;
++    const uint t     = gl_WorkGroupID.y;
++    const uint split = gl_WorkGroupID.z;
++
++    const uint total_blocks = (p.n_kv_max + BC - 1) / BC;
++    const uint b_begin = min(split * p.per_blocks, total_blocks);
++    const uint b_end   = min(b_begin + p.per_blocks, total_blocks);
++    const uint n_blk   = b_end - b_begin;
++    const uint slot0   = b_begin * BC;
++
++    // the slice of the index list, -1 past n_kv_max
++    for (uint s = tid; s < n_blk * BC; s += WG) {
++        const uint slot = slot0 + s;
++        idxsh[s] = slot < p.n_kv_max ? data_i[t * p.n_kv_max + slot] : -1;
++    }
++
++    // S = Q K^T: each group of 32 invocations owns a head pair (qk_hp), DS lanes split the dims and the 4 lane
++    // groups (qk_kg) take every 4th position, so the rows they read sit in different banks.
++    // Each invocation keeps its share of the two scaled query heads in registers.
++    const uint qk_hp = tid / 32;
++    const uint qk_kg = (tid / DS) % 4;
++    const uint qk_ds = tid % DS;
++
++    f16vec4 qr[2][D4 / DS];
++    [[unroll]] for (uint hh = 0; hh < 2; ++hh) {
++        const uint qb = (t * p.q_nb1 + (h0 + 2 * qk_hp + hh) * p.q_nb2) / 4;
++        [[unroll]] for (uint i = 0; i < D4 / DS; ++i) {
++            qr[hh][i] = f16vec4(data_q4[qb + qk_ds + DS * i] * p.scale);
++        }
++    }
++    barrier();
++
++    // gather layout: rows r = it * RPI + tid / D8, 16-byte column tid % D8
++    const uint gc8 = tid % D8;
++    const uint gr0 = tid / D8;
++
++    uvec4 kreg[NIT];
++    float mreg = NEG;
++
++    // prefetch block 0
++    if (n_blk > 0) {
++        [[unroll]] for (uint it = 0; it < NIT; ++it) {
++            const int idx = idxsh[it * RPI + gr0];
++            kreg[it] = idx >= 0 ? data_k8[(uint(idx) * p.k_stride) / 8 + gc8] : uvec4(0);
++        }
++        if (tid < BC) {
++            const int idx = idxsh[tid];
++            mreg = idx >= 0 ? float(data_m[t * p.m_stride + uint(idx)]) : NEG;
++        }
++    }
++
++    // softmax: 16 lanes per head, each takes the adjacent positions 2*sm_c and 2*sm_c+1
++    const uint sm_h = tid / 16;
++    const uint sm_c = tid % 16;
++    float Mh = NEG;
++    float Lh = 0.0;
++
++    // P*V: this invocation owns dims 4*pv_d .. 4*pv_d+3 of heads pv_hh*HPV .. pv_hh*HPV + HPV-1
++    const uint pv_d  = tid % (D / 4);
++    const uint pv_hh = tid / (D / 4);
++    vec4 Of[HPV];
++    [[unroll]] for (uint h = 0; h < HPV; ++h) {
++        Of[h] = vec4(0.0);
++    }
++
++    for (uint b = 0; b < n_blk; ++b) {
++        barrier(); // the previous block is consumed
++
++        [[unroll]] for (uint it = 0; it < NIT; ++it) {
++            const uint r = it * RPI + gr0;
++            const uvec4 u = kreg[it];
++            ksh[r * KS4 + 2 * gc8    ] = f16vec4(unpackFloat2x16(u.x), unpackFloat2x16(u.y));
++            ksh[r * KS4 + 2 * gc8 + 1] = f16vec4(unpackFloat2x16(u.z), unpackFloat2x16(u.w));
++        }
++        if (tid < BC) {
++            msh[tid] = mreg;
++        }
++        barrier();
++
++        // prefetch the next block, it lands while this one is computed
++        if (b + 1 < n_blk) {
++            [[unroll]] for (uint it = 0; it < NIT; ++it) {
++                const int idx = idxsh[(b + 1) * BC + it * RPI + gr0];
++                kreg[it] = idx >= 0 ? data_k8[(uint(idx) * p.k_stride) / 8 + gc8] : uvec4(0);
++            }
++            if (tid < BC) {
++                const int idx = idxsh[(b + 1) * BC + tid];
++                mreg = idx >= 0 ? float(data_m[t * p.m_stride + uint(idx)]) : NEG;
++            }
++        }
++
++        // acc[hh * KPT + c]: head 2*qk_hp + hh, position c*4 + qk_kg
++        float acc[2 * KPT];
++        [[unroll]] for (uint j = 0; j < 2 * KPT; ++j) {
++            acc[j] = 0.0;
++        }
++        [[unroll]] for (uint i = 0; i < D4 / DS; ++i) {
++            [[unroll]] for (uint c = 0; c < KPT; ++c) {
++                const f16vec4 kv = ksh[(c * 4 + qk_kg) * KS4 + qk_ds + DS * i];
++                acc[c]       = dot4_acc(qr[0][i], kv, acc[c]);
++                acc[KPT + c] = dot4_acc(qr[1][i], kv, acc[KPT + c]);
++            }
++        }
++
++        // transpose-reduce over the DS lanes: lane ds ends up with acc[2*ds] and acc[2*ds+1] summed
++        float r8[8];
++        {
++            const bool hi = (qk_ds & 4) != 0;
++            [[unroll]] for (uint k = 0; k < 8; ++k) {
++                const float mine  = hi ? acc[8 + k] : acc[k];
++                const float other = hi ? acc[k] : acc[8 + k];
++                r8[k] = mine + subgroupShuffleXor(other, 4);
++            }
++        }
++        float r4[4];
++        {
++            const bool hi = (qk_ds & 2) != 0;
++            [[unroll]] for (uint k = 0; k < 4; ++k) {
++                const float mine  = hi ? r8[4 + k] : r8[k];
++                const float other = hi ? r8[k] : r8[4 + k];
++                r4[k] = mine + subgroupShuffleXor(other, 2);
++            }
++        }
++        float r2[2];
++        {
++            const bool hi = (qk_ds & 1) != 0;
++            [[unroll]] for (uint k = 0; k < 2; ++k) {
++                const float mine  = hi ? r4[2 + k] : r4[k];
++                const float other = hi ? r4[k] : r4[2 + k];
++                r2[k] = mine + subgroupShuffleXor(other, 1);
++            }
++        }
++        {
++            // acc index 2*ds (+1) -> head 2*qk_hp + ds/4, positions (2*(ds%4) (+1))*4 + qk_kg
++            const uint h  = 2 * qk_hp + qk_ds / 4;
++            const uint c0 = (2 * (qk_ds % 4)    ) * 4 + qk_kg;
++            const uint c1 = (2 * (qk_ds % 4) + 1) * 4 + qk_kg;
++            const float m0 = msh[c0];
++            const float m1 = msh[c1];
++            ssh[c0 * HG + h] = m0 <= NEG ? NEG : r2[0] + m0;
++            ssh[c1 * HG + h] = m1 <= NEG ? NEG : r2[1] + m1;
++        }
++        barrier();
++
++        // online softmax
++        {
++            const float s0 = ssh[(2 * sm_c    ) * HG + sm_h];
++            const float s1 = ssh[(2 * sm_c + 1) * HG + sm_h];
++            float bmax = max(s0, s1);
++            [[unroll]] for (uint o = 8; o > 0; o >>= 1) {
++                bmax = max(bmax, subgroupShuffleXor(bmax, o));
++            }
++            const float Mnew = max(Mh, bmax);
++            const float p0 = s0 <= NEG ? 0.0 : exp(s0 - Mnew);
++            const float p1 = s1 <= NEG ? 0.0 : exp(s1 - Mnew);
++            psh[sm_c * (HG / 4) + sm_h / 4][sm_h % 4] = packFloat2x16(f16vec2(p0, p1));
++            float ls = p0 + p1;
++            [[unroll]] for (uint o = 8; o > 0; o >>= 1) {
++                ls += subgroupShuffleXor(ls, o);
++            }
++            const float eM = exp(Mh - Mnew);
++            Lh = Lh * eM + ls;
++            Mh = Mnew;
++            if (sm_c == 0) {
++                esh[sm_h] = eM;
++            }
++        }
++        barrier();
++
++        [[unroll]] for (uint h = 0; h < HPV; ++h) {
++            Of[h] *= esh[pv_hh * HPV + h];
++        }
++        [[unroll]] for (uint cp = 0; cp < BC / 2; ++cp) {
++            f16vec4 va, vb; // dims 4*pv_d .. 4*pv_d+3 of positions 2*cp and 2*cp+1
++            if (V_SAME != 0) {
++                va = ksh[(2 * cp    ) * KS4 + pv_d];
++                vb = ksh[(2 * cp + 1) * KS4 + pv_d];
++            } else {
++                const int ia = idxsh[b * BC + 2 * cp];
++                const int ib = idxsh[b * BC + 2 * cp + 1];
++                va = ia >= 0 ? data_v4[(uint(ia) * p.v_stride) / 4 + pv_d] : f16vec4(0.0);
++                vb = ib >= 0 ? data_v4[(uint(ib) * p.v_stride) / 4 + pv_d] : f16vec4(0.0);
++            }
++            const f16vec2 vx = f16vec2(va.x, vb.x);
++            const f16vec2 vy = f16vec2(va.y, vb.y);
++            const f16vec2 vz = f16vec2(va.z, vb.z);
++            const f16vec2 vw = f16vec2(va.w, vb.w);
++            [[unroll]] for (uint h4 = 0; h4 < HPV / 4; ++h4) {
++                const uvec4 pk = psh[cp * (HG / 4) + pv_hh * (HPV / 4) + h4];
++                [[unroll]] for (uint k = 0; k < 4; ++k) {
++                    const f16vec2 pp = unpackFloat2x16(pk[k]);
++                    const uint h = 4 * h4 + k;
++                    Of[h].x = dot2_acc(pp, vx, Of[h].x);
++                    Of[h].y = dot2_acc(pp, vy, Of[h].y);
++                    Of[h].z = dot2_acc(pp, vz, Of[h].z);
++                    Of[h].w = dot2_acc(pp, vw, Of[h].w);
++                }
++            }
++        }
++    }
++
++    if (p.k_num == 1) {
++        // single split: normalize and write dst [D, ne1, N] directly
++        barrier();
++        if (sm_c == 0) {
++            esh[sm_h] = Lh == 0.0 ? 0.0 : 1.0 / Lh;
++        }
++        barrier();
++        const uint d_base = (t * p.ne1 + h0 + pv_hh * HPV) * D;
++        [[unroll]] for (uint h = 0; h < HPV; ++h) {
++            data_o4[(d_base + h * D) / 4 + pv_d] = Of[h] * esh[pv_hh * HPV + h];
++        }
++        return;
++    }
++
++    // split_k partials, same layout as the FA shaders with a gqa fold (heads in place of rows)
++    const uint o_base = D * p.ne1 * (split + p.k_num * t) + (h0 + pv_hh * HPV) * D;
++    [[unroll]] for (uint h = 0; h < HPV; ++h) {
++        data_o4[(o_base + h * D) / 4 + pv_d] = Of[h];
++    }
++    if (sm_c == 0) {
++        const uint lm_base = D * p.ne1 * p.k_num * p.N + p.ne1 * 2 * (split + p.k_num * t);
++        data_o[lm_base + h0 + sm_h]         = Lh;
++        data_o[lm_base + p.ne1 + h0 + sm_h] = Mh;
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 9e0d1b878..a5a653c0d 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -942,6 +942,8 @@ void process_shaders() {
+ 
+     string_to_spv("fa_sparse_compact", "flash_attn_sparse_compact.comp", {});
+     string_to_spv("fa_sparse_compact_subgroup", "flash_attn_sparse_compact.comp", {{"USE_SUBGROUPS", "1"}});
++    string_to_spv("fa_sparse_dec", "flash_attn_sparse_dec.comp", {});
++    string_to_spv("fa_sparse_dec_dot2", "flash_attn_sparse_dec.comp", {{"DOT2_F16", "1"}});
+ 
+     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
+     string_to_spv("quantize_q8_1_subgroup", "quantize_q8_1.comp", {{"USE_SUBGROUPS", "1"}});
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index e9fd3c2c3..1123263b4 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12256,6 +12256,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     for (int64_t kv : { 1024, 3000 }) for (int64_t nb : { 2, 3, 5 }) {
+         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+     }
++    // Sparse decode path (flash_attn_sparse_dec): separate V, 32/64 heads, a budget that is not a multiple of the
++    // block size, and a split count limited by the per-workgroup index slice.
++    for (int64_t nb : { 1, 3, 8 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 8192, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
++        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 8192, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 1000));
++        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {32, 1}, 65536, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 8192));
++    }
++    // GLM-5.3-Flash selects 2048 positions plus the 3 incomplete k-pool tail cells; prefill batches use one split
++    for (int64_t nb : { 1, 3, 64 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 16384, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 2051));
++    }
+ 
+     // Sparse gather: native block sizes, padded slots, and head/batch strides.
+     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
+@@ -13069,6 +13080,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+             }
+         }
+     }
++    // GLM-5.3-Flash DSA sparse FA decode (MLA 512, 64 heads on 1 KV head, V a view of K, 2048 selected positions)
++    for (int kv : { 8192, 32768, 65536 }) {
++        for (int nb : { 1, 2, 3 }) {
++            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 2048));
++        }
++    }
++    // prefill ubatches at depth
++    for (int nb : { 128, 512 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 2048));
++    }
++    // the same attention without the sparse gather: dense over just the 2048 selected positions
++    for (int nb : { 1, 3 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 2048, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 0));
++    }
++
+     // lightning_indexer
+     for (int kv : { 256, 4096, 65536 }) {
+         for (int bs : { 1, 512, 2048 }) {
+-- 
+2.43.0
+

@@ -1,0 +1,40 @@
+From 69b38f9b4052beb75c35a043bf0849f12204eb6f Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 20:21:40 -0400
+Subject: [PATCH 25/46] imatrix: fix split GGUFs with NextN layers and
+ source-less graph ops
+
+- The NextN draft check read only shard 1 of a split GGUF and rejected full models.
+- collect_imatrix dereferenced src[0] of ops without sources (FILL, ARANGE, ...).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/imatrix/imatrix.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/tools/imatrix/imatrix.cpp b/tools/imatrix/imatrix.cpp
+index 5e9f911e0..3c20261d1 100644
+--- a/tools/imatrix/imatrix.cpp
++++ b/tools/imatrix/imatrix.cpp
+@@ -563,6 +563,8 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void *
+ 
+     const struct ggml_tensor * src0 = t->src[0];
+     const struct ggml_tensor * src1 = t->src[1];
++    // source-less ops (FILL, ARANGE, ...) also reach the callback
++    if (src0 == nullptr) { return false; }
+     std::string wname = filter_tensor_name(src0->name);
+ 
+     const int32_t chunk_size = m_params.n_ctx / m_params.n_parallel;
+@@ -1911,7 +1913,8 @@ int main(int argc, char ** argv) {
+             LOG_ERR("%s: the model already includes NextN layers (NextN tensor '%s')\n", __func__, shape.first_nextn.c_str());
+             return 1;
+         }
+-        if (!use_draft && !shape.has_trunk && (shape.n_nextn_layers > 0 || shape.has_nextn)) {
++        // a split GGUF only shows shard 1 here, which need not hold any trunk tensor
++        if (!use_draft && !shape.is_split && !shape.has_trunk && (shape.n_nextn_layers > 0 || shape.has_nextn)) {
+             LOG_ERR("%s: '%s' is a NextN draft, use with --model-draft/-md\n", __func__, params.model.path.c_str());
+             return 1;
+         }
+-- 
+2.43.0
+

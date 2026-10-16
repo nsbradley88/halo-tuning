@@ -2,8 +2,9 @@
 
 Model: Xiaomi MiMo-V2.6-Flash-MOPD (309B total / 15B active MoE; 48 layers + 3 MTP layers: 9 full-attention layers with K 192 / V 128 and 4 KV
 heads, the rest sliding-window-128 with sinks; 256 experts, top-8). Starting quant: the BPW2.5 release (97 GB).
-Engine: llama.cpp with our [patch series](../patches/llama.cpp/), Vulkan, `-fa on`, q8_0 K and V, 196,608 context.
-Presets: [configs/mimo/](../configs/mimo/).
+Engine: llama.cpp `529ac893e` + our [unified patch series](../patches/llama.cpp-halo/) (recommended; the first numbers below
+are from `a8c9a4e7c` + the [Laguna/MiMo series](../patches/llama.cpp/)), Vulkan, `-fa on`, q8_0 K and V, 196,608 context.
+Presets: [configs/mimo/](../configs/mimo/) (`mimo-v2.6-flash-halo.env` for the unified build).
 
 ## Final numbers
 
@@ -14,6 +15,43 @@ Presets: [configs/mimo/](../configs/mimo/).
 | Decode (llama-bench tg64) @ 0 / 32K | 26.2 / 24.4 | **30.7–32.0 / 28.4–28.6** (no speculation) |
 | Agentic suite (5 Go tasks) | 5/5, 23.9 tok/s | 5/5, 30.7 tok/s; **thinking off: 5/5 in 923 s, 34.2 tok/s** |
 | Needle (15) | 15/15 | 15/15 (every adopted config) |
+
+## Unified build (2026-10-16)
+
+The Qwen3.8-27B kernels plus two new patches, on the [unified series](../patches/llama.cpp-halo/). Same session against the
+`a8c9a4e7c` build with the same config, on the 27B harness (chat: 6 prompts at temperature 1.0; code: 6 greedy; edits: three
+~9 KB C++ files rewritten whole, greedy). Draft acceptance in brackets.
+
+| tok/s | `a8c9a4e7c` build, DFlash n4 | **Unified build + DFlash draft vocab, n4** |
+|---|---|---|
+| Chat | 28.7 (0.51) | **31.0** (0.54), +8% |
+| Code | 35.3 (0.73) | **39.7** (0.70), +13% |
+| Agentic edits | 43.8 | **50.6**, +16% |
+| Decode @2K / 32K (128 tokens) | 28.3 / 25.1 | **31.8 / 27.7**, +12% / +10% |
+| Prompt @2K / 32K | 273–307 / 251–290 | 311 / 284 (unchanged within noise) |
+
+Quality: KLD vs the release logits (2,048 context, `-ub 5` so the expert matvec path is measured) 0.02785 → **0.02784**.
+Gate on the adopted config: **needle 15/15** at 81K, **agentic 5/5** (thinking on, 1,412 s). With `--cache-ram 8192`
+(also gated) MemAvailable fell to 11 GiB.
+
+What made the difference:
+
+- **Integer-dot expert matvecs** (patches 0044, 0046). Decode and verify (up to 8 tokens) run the experts through
+  MUL_MAT_ID matvecs, and Vulkan had integer-dot (q8_1) pipelines there only up to IQ4_XS / IQ1 / K-quants, so MiMo's
+  IQ2_XXS / IQ3_XXS / IQ2_XS experts ran on the float path. New pipelines with 4 rows per workgroup: −12 to −27% per
+  5-token expert matvec.
+- **Draft vocabulary for the DFlash drafter** (patch 0045, `--spec-draft-vocab`). MiMo's drafter has its own 152,576-row
+  Q8_0 head (664 MB). Scoring the 64K most frequent tokens covers 99.6–99.9% of held-out text:
+  +1–4% on top of the kernels. The subset is [configs/mimo/mimo-dv-65536.bin](../configs/mimo/), built with
+  [make_vocab.py](../configs/mimo/make_vocab.py) (same corpus as the 27B subset, tokenized with MiMo's tokenizer).
+
+| Also tried on the unified build | Result |
+|---|---|
+| DFlash n3 / n5 / n6 | chat 32.1 / 30.2 / 29.1, code 38.2 / 37.9 / 37.3, edits 46.4 / 52.1 / 53.2: n3 for chat-heavy use, n5–6 for edit-heavy use |
+| `ngram-mod` next to DFlash | edits **−18%** (50.6 → 41.7): DFlash already accepts 98% on edits |
+| KV slice 2048 (the 27B default) / head-outer order | prefill within noise of slice 8192 |
+
+Prefill is unchanged: the expert matmuls dominate it (see [the prefill profile](#prefill-profile-where-the-remaining-time-goes)).
 
 ## What worked
 
@@ -54,12 +92,18 @@ rewrite of the Vulkan MoE path; we have not done it.
 ## Reproduce
 
 ```sh
+git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp && git checkout 529ac893e
+git am /path/to/halo-tuning/patches/llama.cpp-halo/*.patch
+cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+
 export GGML_VK_FA_WAVE32=1 GGML_VK_FA_KV_SLICE=8192 LLAMA_SPEC_ADAPTIVE=1.2
 llama-server -m MiMo-V2.6-Flash-MOPD-a4-00001-of-00003.gguf -ngl 999 -fa on -fit off --parallel 1 --ctx-size 196608 \
   -ctk q8_0 -ctv q8_0 --ubatch-size 2048 --batch-size 2048 --cache-ram 0 --jinja --temp 1.0 --top-p 1.0 --top-k 20 \
-  --min-p 0.0 -md dflash-MiMo-V2.6-Flash-MOPD-Q8_0.gguf -ngld 999 --spec-type draft-dflash --spec-draft-n-max 4
-# agentic preset: add --reasoning off. Keep ub 2048 here (memory).
+  --min-p 0.0 -md dflash-MiMo-V2.6-Flash-MOPD-Q8_0.gguf -ngld 999 --spec-type draft-dflash --spec-draft-n-max 4 \
+  --spec-draft-vocab mimo-dv-65536.bin
+# agentic preset: add --reasoning off. Keep ub 2048 here (memory). No ngram-mod.
 ```
 
-On stock llama.cpp: the a4 quant (if you can requantize), DFlash, thinking off and dense attention all work; the adaptive
-pause and KV slicing need the patches.
+The older `a8c9a4e7c` + [Laguna/MiMo series](../patches/llama.cpp/) build runs the same command without
+`--spec-draft-vocab`. On stock llama.cpp: the a4 quant (if you can requantize), DFlash, thinking off and dense attention all
+work; the adaptive pause, KV slicing, integer-dot expert matvecs and the draft vocabulary need the patches.

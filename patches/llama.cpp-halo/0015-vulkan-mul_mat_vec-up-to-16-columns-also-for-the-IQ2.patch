@@ -1,0 +1,39 @@
+From 6df2a2cba2e06118b678ce55a48948c2ced667a5 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 10:18:17 +0000
+Subject: [PATCH 15/46] vulkan: mul_mat_vec up to 16 columns also for the
+ IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S MMVQ kernels
+
+Cold weights 17408x5120 on Radeon 8060S, us at n = 9/12/16, matmul path -> mul_mat_vec: iq3_s 795/799/791 ->
+316/382/472, iq3_xxs 745/751/748 -> 300/371/467, iq2_s 619/648/630 -> 317/384/481.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 1bca7625c..7e9b63576 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -6741,6 +6741,7 @@ static bool ggml_vk_type_has_mmvq(ggml_type type) {
+         case GGML_TYPE_Q2_0: case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
+         case GGML_TYPE_Q8_0: case GGML_TYPE_MXFP4: case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K:
+         case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ1_M: case GGML_TYPE_IQ4_XS:
++        case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:
+             return true;
+         default:
+             return false;
+@@ -6751,7 +6752,8 @@ static bool ggml_vk_type_has_mmvq(ggml_type type) {
+ // weights per tile: on RDNA3/4 the MMVQ kernels stay ahead up to 16 columns, the float dequant kernels only at 9.
+ // Cold weights on Radeon 8060S (gfx1151), Qwen3.8-27B shapes, us at n = 9 / 12 / 16 (matmul path -> mul_mat_vec):
+ // iq4_xs 17408x5120 716/718/723 -> 324/399/500, q5_K 762/757/772 -> 410/500/618, q8_0 5120x6144 232/238/243 ->
+-// 195/211/234; float path q6_K 5120x17408 892/890/910 -> 709/913/1372, iq3_s 801/850/793 -> 587/903/3499.
++// 195/211/234, iq3_s (MMVQ) 795/799/791 -> 316/382/472, iq2_s 619/648/630 -> 317/384/481; float path q6_K 5120x17408
++// 892/890/910 -> 709/913/1372.
+ static uint32_t ggml_vk_mmv_max_cols(const ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
+     const vk_device & device = ctx->device;
+     if (device->mmv_max_cols != 0) {
+-- 
+2.43.0
+

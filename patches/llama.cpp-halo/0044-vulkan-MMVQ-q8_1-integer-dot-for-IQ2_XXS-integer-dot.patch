@@ -1,0 +1,295 @@
+From 9b01d8702347998e76fc27d9ccd48623da592a59 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 17:31:54 +0000
+Subject: [PATCH 44/46] vulkan: MMVQ (q8_1 integer dot) for IQ2_XXS;
+ integer-dot MUL_MAT_ID mat-vec for IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S
+
+- mmvq_dot_product for IQ2_XXS (grid lookup, 7 sign bits + parity, byte-wise two's complement as for the other
+  IQ2/IQ3 types), dense mat-vec up to 16 columns like IQ2_XS.
+- The MUL_MAT_ID mat-vec (MoE experts at decode and verify, one dispatch per token) had q8_1 pipelines only up to
+  IQ4_XS / IQ1_S / IQ1_M / K-quants; the IQ2 / IQ3 experts (MiMo-V2.6-Flash a4: 40% IQ2_XXS, 35% IQ3_XXS, 8% IQ2_XS;
+  GLM-5.3-Flash a4e3s: IQ2_S / IQ3_S) ran on the float path. Rows per workgroup: GGML_VK_IQ_ID_ROWS (default 1).
+- A/B knobs: GGML_VK_NO_IQ_ID_MMVQ=1 (expert mat-vec), GGML_VK_NO_IQ2_MMVQ=1 now also covers IQ2_XXS.
+- test-backend-ops: MUL_MAT_ID at the MiMo / GLM expert shapes (2048x4096, 4096x2048, 1..8 tokens, 16 experts) and
+  dense mat-vec 1..16 columns for IQ2_XXS/IQ3_XXS/IQ2_XS/IQ1_M/Q2_K/IQ2_S/IQ3_S; perf cases with 256 / 288 experts
+  and random weight bytes (test_mul_mat_id_fast from the moe-vec branch).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 25 +++++-
+ .../vulkan-shaders/mul_mat_vecq.comp          |  2 +-
+ .../vulkan-shaders/mul_mat_vecq_funcs.glsl    | 26 +++++-
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |  4 +-
+ tests/test-backend-ops.cpp                    | 88 +++++++++++++++++++
+ 5 files changed, 140 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index d06e3ef24..28091870e 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -2952,6 +2952,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         sscanf(e, "%u%*c%u", &iq3_rows_1, &iq3_rows_5);
+     }
+     auto const &rm_iq3_n = [&](uint32_t rows, uint32_t i) { GGML_UNUSED(rows); return i >= 4 ? iq3_rows_5 : iq3_rows_1; };
++    // IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S MUL_MAT_ID MMVQ: rows per workgroup (env GGML_VK_IQ_ID_ROWS)
++    uint32_t iq_id_rows = 1;
++    if (const char * e = getenv("GGML_VK_IQ_ID_ROWS")) {
++        iq_id_rows = std::max(1, atoi(e));
++    }
+     // RDNA3/4 and NVIDIA except pre-Turing: use 4 rows for MUL_MAT_ID MMVQ.
+     auto const &rm_id = [&](uint32_t rows) {
+         if (device->vendor_id == VK_VENDOR_ID_NVIDIA &&
+@@ -3084,6 +3089,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ3_XXS][i], "mul_mat_vec_iq3_xxs_q8_1_f32", arr_dmmv_iq3_xxs_q8_1_f32_len[reduc], arr_dmmv_iq3_xxs_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq3_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_iq3_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ2_S][i], "mul_mat_vec_iq2_s_q8_1_f32", arr_dmmv_iq2_s_q8_1_f32_len[reduc], arr_dmmv_iq2_s_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq3_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_iq3_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ2_XS][i], "mul_mat_vec_iq2_xs_q8_1_f32", arr_dmmv_iq2_xs_q8_1_f32_len[reduc], arr_dmmv_iq2_xs_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq3_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_iq3_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
++                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ2_XXS][i], "mul_mat_vec_iq2_xxs_q8_1_f32", arr_dmmv_iq2_xxs_q8_1_f32_len[reduc], arr_dmmv_iq2_xxs_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq3_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_iq3_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+ 
+             }
+ #endif // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
+@@ -3141,6 +3147,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_IQ1_S], "mul_mat_vec_id_iq1_s_q8_1_f32", arr_dmmv_id_iq1_s_q8_1_f32_len[reduc], arr_dmmv_id_iq1_s_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_iq_int(0), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(0)}, 1, true, use_subgroups, subgroup_size_int);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_IQ1_M], "mul_mat_vec_id_iq1_m_q8_1_f32", arr_dmmv_id_iq1_m_q8_1_f32_len[reduc], arr_dmmv_id_iq1_m_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_iq_int(0), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(0)}, 1, true, use_subgroups, subgroup_size_int);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_IQ4_XS], "mul_mat_vec_id_iq4_xs_q8_1_f32", arr_dmmv_id_iq4_xs_q8_1_f32_len[reduc], arr_dmmv_id_iq4_xs_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_id(1*rm_stdq_int), 1, 1}, {wg_size_subgroup_int, rm_id(1*rm_stdq_int)}, 1, true, use_subgroups, subgroup_size_int);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_IQ3_S], "mul_mat_vec_id_iq3_s_q8_1_f32", arr_dmmv_id_iq3_s_q8_1_f32_len[reduc], arr_dmmv_id_iq3_s_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {iq_id_rows, 1, 1}, {wg_size_subgroup_int, iq_id_rows}, 1, true, use_subgroups, subgroup_size_int);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_IQ3_XXS], "mul_mat_vec_id_iq3_xxs_q8_1_f32", arr_dmmv_id_iq3_xxs_q8_1_f32_len[reduc], arr_dmmv_id_iq3_xxs_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {iq_id_rows, 1, 1}, {wg_size_subgroup_int, iq_id_rows}, 1, true, use_subgroups, subgroup_size_int);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_IQ2_S], "mul_mat_vec_id_iq2_s_q8_1_f32", arr_dmmv_id_iq2_s_q8_1_f32_len[reduc], arr_dmmv_id_iq2_s_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {iq_id_rows, 1, 1}, {wg_size_subgroup_int, iq_id_rows}, 1, true, use_subgroups, subgroup_size_int);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_IQ2_XS], "mul_mat_vec_id_iq2_xs_q8_1_f32", arr_dmmv_id_iq2_xs_q8_1_f32_len[reduc], arr_dmmv_id_iq2_xs_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {iq_id_rows, 1, 1}, {wg_size_subgroup_int, iq_id_rows}, 1, true, use_subgroups, subgroup_size_int);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_IQ2_XXS], "mul_mat_vec_id_iq2_xxs_q8_1_f32", arr_dmmv_id_iq2_xxs_q8_1_f32_len[reduc], arr_dmmv_id_iq2_xxs_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {iq_id_rows, 1, 1}, {wg_size_subgroup_int, iq_id_rows}, 1, true, use_subgroups, subgroup_size_int);
+         }
+ #endif // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
+     }
+@@ -5682,6 +5693,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+             case GGML_TYPE_IQ3_XXS:
+             case GGML_TYPE_IQ2_S:
+             case GGML_TYPE_IQ2_XS:
++            case GGML_TYPE_IQ2_XXS:
+                 break;
+             default:
+                 return nullptr;
+@@ -5783,6 +5795,11 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
+             case GGML_TYPE_IQ1_S:
+             case GGML_TYPE_IQ1_M:
+             case GGML_TYPE_IQ4_XS:
++            case GGML_TYPE_IQ3_S:
++            case GGML_TYPE_IQ3_XXS:
++            case GGML_TYPE_IQ2_S:
++            case GGML_TYPE_IQ2_XS:
++            case GGML_TYPE_IQ2_XXS:
+                 break;
+             default:
+                 return nullptr;
+@@ -6765,7 +6782,7 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
+     static const bool no_iq3_mmvq = getenv("GGML_VK_NO_IQ3_MMVQ") != nullptr;
+     static const bool no_iq2_mmvq = getenv("GGML_VK_NO_IQ2_MMVQ") != nullptr;
+     if ((no_iq3_mmvq && (src0_type == GGML_TYPE_IQ3_S || src0_type == GGML_TYPE_IQ3_XXS)) ||
+-        (no_iq2_mmvq && (src0_type == GGML_TYPE_IQ2_S || src0_type == GGML_TYPE_IQ2_XS))) {
++        (no_iq2_mmvq && (src0_type == GGML_TYPE_IQ2_S || src0_type == GGML_TYPE_IQ2_XS || src0_type == GGML_TYPE_IQ2_XXS))) {
+         return false;
+     }
+ 
+@@ -8028,6 +8045,12 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
+ 
+     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
+     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne12, ne10, src0->type);
++    // A/B knob: GGML_VK_NO_IQ_ID_MMVQ=1 keeps the IQ2 / IQ3 expert mat-vec on the float path
++    static const bool no_iq_id_mmvq = getenv("GGML_VK_NO_IQ_ID_MMVQ") != nullptr;
++    if (no_iq_id_mmvq && (src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ2_S ||
++                          src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ2_XXS)) {
++        quantize_y = false;
++    }
+ 
+     vk_pipeline to_fp16_vk_0 = nullptr;
+     vk_pipeline to_fp16_vk_1 = nullptr;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
+index 094ae14e6..063a015e5 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
+@@ -16,7 +16,7 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ #define K_PER_ITER 16
+ #elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
+ #define K_PER_ITER 8
+-#elif defined(DATA_A_IQ1_S) || defined(DATA_A_IQ1_M) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ2_XS)
++#elif defined(DATA_A_IQ1_S) || defined(DATA_A_IQ1_M) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_XXS)
+ #define K_PER_ITER 32
+ #else
+ #error unimplemented
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
+index cfbe00a16..32afa0e37 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
+@@ -585,7 +585,7 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+ }
+ #endif
+ 
+-#if defined(DATA_A_IQ3_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ2_XS)
++#if defined(DATA_A_IQ3_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_XXS)
+ // grid bytes g (all >= 1) with the 4 sign bits s applied: byte-wise two's complement negation, no carries
+ int32_t iq3_signed_grid(const uint g, const uint s) {
+     const uint m = ((s & 0xF) * 0x00204081u) & 0x01010101u; // sign bit i -> bit 0 of byte i
+@@ -694,3 +694,27 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+     return FLOAT_TYPE(float(cache_b_ds.x) * d * 0.25 * sum);
+ }
+ #endif
++
++#if defined(DATA_A_IQ2_XXS)
++FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
++    const uint ib = ib_a / 8;
++    const uint ib32 = ib_a % 8;
++
++    // 4 x 8-bit grid indices, then 4 x 7 sign bits (the 8th is the parity) and the 4-bit scale of this 32-value group
++    const uint qi = uint(data_a_packed16[ib].qs[4 * ib32    ]) | (uint(data_a_packed16[ib].qs[4 * ib32 + 1]) << 16);
++    const uint ss = uint(data_a_packed16[ib].qs[4 * ib32 + 2]) | (uint(data_a_packed16[ib].qs[4 * ib32 + 3]) << 16);
++
++    int32_t q_sum = 0;
++    [[unroll]] for (uint l = 0; l < 4; ++l) {
++        uint s = bitfieldExtract(ss, 7 * int(l), 7);
++        s |= (bitCount(s) & 1) << 7;
++        const uvec2 g = iq2xxs_grid[(qi >> (8 * l)) & 0xFF];
++        q_sum += dotPacked4x8EXT(iq3_signed_grid(g.x, s     ), cache_b_qs[2 * l    ]);
++        q_sum += dotPacked4x8EXT(iq3_signed_grid(g.y, s >> 4), cache_b_qs[2 * l + 1]);
++    }
++
++    const float d = float(data_a_packed16[ib].d) * (0.5 + float(ss >> 28)) * 0.25;
++
++    return FLOAT_TYPE(float(cache_b_ds.x) * d * float(q_sum));
++}
++#endif
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 99815149e..7f90af42e 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -814,7 +814,7 @@ void process_shaders() {
+ 
+         // mul mat vec with integer dot product
+ #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+-        if (is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m" || tname == "iq4_xs" || tname == "iq3_s" || tname == "iq3_xxs" || tname == "iq2_s" || tname == "iq2_xs") {
++        if (is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m" || tname == "iq4_xs" || tname == "iq3_s" || tname == "iq3_xxs" || tname == "iq2_s" || tname == "iq2_xs" || tname == "iq2_xxs") {
+             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}}));
+             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+@@ -1348,7 +1348,7 @@ void write_output_files() {
+ 
+     for (const std::string& btype : btypes) {
+     for (const auto& tname : type_names) {
+-        if (btype == "q8_1" && !is_legacy_quant(tname) && tname != "mxfp4" && !is_k_quant(tname) && tname != "iq1_s" && tname != "iq1_m" && tname != "iq4_xs" && tname != "iq3_s" && tname != "iq3_xxs" && tname != "iq2_s" && tname != "iq2_xs") {
++        if (btype == "q8_1" && !is_legacy_quant(tname) && tname != "mxfp4" && !is_k_quant(tname) && tname != "iq1_s" && tname != "iq1_m" && tname != "iq4_xs" && tname != "iq3_s" && tname != "iq3_xxs" && tname != "iq2_s" && tname != "iq2_xs" && tname != "iq2_xxs") {
+             continue;
+         }
+         hdr << "extern const void * arr_dmmv_"   << tname << "_" << btype << "_f32_data[3];\n";
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b7f0d50d4..22fdbdc52 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5847,6 +5847,64 @@ struct test_mul_mat_id : public test_case {
+     }
+ };
+ 
++// MUL_MAT_ID for perf at real MoE sizes: quantizing hundreds of MB of IQ weights on the CPU takes minutes, so the
++// expert weights are random bytes (timing only, the values are meaningless; use test_mul_mat_id for correctness)
++struct test_mul_mat_id_fast : public test_mul_mat_id {
++    int pool = 0; // > 0: every token draws its experts from one random pool of this many experts (consecutive tokens
++                  // share most experts in practice: a 3-token verify routes to ~10 distinct experts, not 24)
++
++    test_mul_mat_id_fast(ggml_type type_a, ggml_type type_b, int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k, int pool = 0)
++        : test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k), pool(pool) {}
++
++    std::string vars() override { return test_mul_mat_id::vars() + ",fast=1,pool=" + std::to_string(pool); }
++
++    void init_ids(ggml_context * ctx) {
++        if (pool == 0) {
++            init_mul_mat_id_ids(ctx, n_mats);
++            return;
++        }
++        static std::default_random_engine rng(7);
++        std::vector<int32_t> all(n_mats);
++        for (int i = 0; i < n_mats; i++) { all[i] = i; }
++        std::shuffle(all.begin(), all.end(), rng);
++        std::vector<int32_t> pl(all.begin(), all.begin() + pool);
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
++                continue;
++            }
++            for (int64_t r = 0; r < ggml_nrows(t); r++) {
++                std::vector<int32_t> data(t->ne[0]);
++                std::shuffle(pl.begin(), pl.end(), rng);
++                for (int i = 0; i < t->ne[0]; i++) {
++                    data[i] = i < pool ? pl[i] : all[i % n_mats]; // only the first n_used <= pool are read
++                }
++                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
++            }
++        }
++    }
++
++    void reinit_perf_iter(ggml_context * ctx) override { init_ids(ctx); }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        std::mt19937 rng(42);
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->type == GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
++                continue;
++            }
++            if (ggml_is_quantized(t->type)) {
++                std::vector<uint32_t> data(ggml_nbytes(t) / 4 + 1);
++                for (auto & v : data) {
++                    v = rng() & 0x3bff3bffu; // keep 16-bit halves finite where they are fp16 scales
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++        init_ids(ctx);
++    }
++};
++
+ // MUL_MAT_ID with expert ids repeated within a token's row
+ struct test_mul_mat_id_dup : public test_mul_mat_id {
+     using test_mul_mat_id::test_mul_mat_id;
+@@ -12760,6 +12818,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // MoE expert mat-vec (MUL_MAT_ID with up to 8 tokens: decode and speculative verify) at the expert shapes of
++    // MiMo-V2.6-Flash a4 (256 experts, 2048 x 4096 gate/up, 4096 x 2048 down) and GLM-5.3-Flash a4e3s (288 experts,
++    // same matrix shapes), with 16 experts here to keep the CPU quantization fast
++    for (ggml_type type_a : { GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ1_M, GGML_TYPE_Q2_K,
++                              GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S }) {
++        for (int n : {1, 2, 3, 5, 8}) {
++            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, true,  2048, n, 4096));
++            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, false, 4096, n, 2048));
++        }
++        test_cases.emplace_back(new test_mul_mat_id_dup(type_a, GGML_TYPE_F32, 16, 8, false, 4096, 3, 2048));
++        // dense mat-vec of the same type (MMVQ), 1..16 columns
++        for (int n : {1, 3, 5, 9, 16}) {
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2048, n, 4096, {1, 1}, {1, 1}));
++        }
++    }
++
+     return test_cases;
+ }
+ #ifdef _MSC_VER
+@@ -12770,6 +12844,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // MoE expert mat-vec at real sizes, expert weights random bytes, ids re-randomized per run (mostly cold):
++    // MiMo-V2.6-Flash a4 (256 experts, 8 used) and GLM-5.3-Flash a4e3s (288 experts, 8 used); pool 40: about 30
++    // distinct experts for 5 tokens
++    for (int n : {1, 3, 5}) {
++        for (ggml_type t : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ1_M, GGML_TYPE_Q2_K}) {
++            test_cases.emplace_back(new test_mul_mat_id_fast(t, GGML_TYPE_F32, 256, 8, true,  2048, n, 4096, n == 1 ? 0 : 40));
++            test_cases.emplace_back(new test_mul_mat_id_fast(t, GGML_TYPE_F32, 256, 8, false, 4096, n, 2048, n == 1 ? 0 : 40));
++        }
++        for (ggml_type t : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S}) {
++            test_cases.emplace_back(new test_mul_mat_id_fast(t, GGML_TYPE_F32, 288, 8, true,  2048, n, 4096, n == 1 ? 0 : 42));
++            test_cases.emplace_back(new test_mul_mat_id_fast(t, GGML_TYPE_F32, 288, 8, false, 4096, n, 2048, n == 1 ? 0 : 42));
++        }
++    }
++
+     add_q27_verify_mul_mat_cases(test_cases, true);
+     add_glm_verify_mul_mat_cases(test_cases, true);
+ 
+-- 
+2.43.0
+

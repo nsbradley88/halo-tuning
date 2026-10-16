@@ -1,0 +1,84 @@
+From 05e28d7c04ced704db310ae40a163d1a29aa006c Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 17:46:20 +0000
+Subject: [PATCH 45/46] speculative: draft-vocabulary subset for DFlash1
+ drafters (--spec-draft-vocab)
+
+DFlash1 drafters (MiMo-V2.6-Flash: own Q8_0 head 152576 x 4096, 664 MB read per draft block; Laguna-S-2.1: the
+target's head) compute the full output head for every block position although only the top draft per position
+is used. llama_set_draft_vocab() now accepts any DFlash context without d2t; the DFlash1 graph computes only the
+subset rows and scatters them to the full vocabulary with -inf elsewhere (build_mtp_head), so the sampler is
+unchanged. Verification is unchanged, so the output stays exact; tokens outside the subset are never drafted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp | 5 +++--
+ src/llama-context.cpp  | 7 ++++---
+ src/models/dflash.cpp  | 6 ++++++
+ 3 files changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index f9b0d2cd2..c8cc06beb 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1117,7 +1117,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             }
+         }
+ 
+-        // draft-vocabulary subset of the output head (DFlash2 only: its selector reads the head's top-k in the graph)
++        // draft-vocabulary subset of the output head (DFlash2: the selector reads the head's top-k in the graph;
++        // DFlash1: subset logits scattered to the full vocabulary)
+         if (!this->params.vocab.empty()) {
+             std::vector<llama_token> ids;
+             if (FILE * f = fopen(this->params.vocab.c_str(), "rb")) {
+@@ -1127,7 +1128,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                 }
+                 fclose(f);
+             }
+-            if (!is_dflash2 || ids.empty() || !llama_set_draft_vocab(ctx_dft, ids.data(), (int32_t) ids.size())) {
++            if (ids.empty() || !llama_set_draft_vocab(ctx_dft, ids.data(), (int32_t) ids.size())) {
+                 SPC_WRN("draft vocabulary '%s' not applied (%zu ids); using the full head\n",
+                         this->params.vocab.c_str(), ids.size());
+             }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 4c09f9ecc..dacaeecb3 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1398,10 +1398,11 @@ bool llama_context::set_draft_vocab(const llama_token * ids, int32_t n_ids) {
+     }
+ 
+     // DFlash2 drafts read the top-k of the (target's) output head through the selector: the subset head computes
+-    // only the subset rows and the candidate positions map back to token ids in the graph
+-    const bool is_dflash2 = model.arch == LLM_ARCH_DFLASH && model.dflash_selector_hidden != nullptr && model.d2t == nullptr;
++    // only the subset rows and the candidate positions map back to token ids in the graph. DFlash1 drafts (own or
++    // shared head, logits read by the sampler) compute the subset rows and scatter them to the full vocabulary.
++    const bool is_dflash2 = model.arch == LLM_ARCH_DFLASH && model.d2t == nullptr;
+     if (!is_dflash2 && (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || (model.arch != LLM_ARCH_QWEN35 && model.arch != LLM_ARCH_QWEN35MOE && model.arch != LLM_ARCH_GLM5_NEXT) || model.hparams.n_layer_nextn == 0)) {
+-        LLAMA_LOG_WARN("%s: the draft vocabulary is only supported for Qwen3.5 / Qwen3.5-MoE / GLM5-Next MTP and DFlash2 draft contexts\n", __func__);
++        LLAMA_LOG_WARN("%s: the draft vocabulary is only supported for Qwen3.5 / Qwen3.5-MoE / GLM5-Next MTP and DFlash draft contexts\n", __func__);
+         return false;
+     }
+ 
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index d23bc667b..7969efee3 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -879,9 +879,15 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
+     // (only when no logits are read back: DFlash2 draft batches request none, other decodes keep the full head)
+     const bool dvocab = model.dflash_selector_hidden && !model.d2t && cparams.dvocab_head != nullptr && n_outputs == 0 &&
+                         output_s == nullptr && loras->empty() && cparams.dvocab_head->ne[0] == output->ne[0];
++    // DFlash1: the sampler reads the draft logits; the subset rows are computed and scattered to the full
++    // vocabulary with -inf elsewhere (build_mtp_head), so tokens outside the subset are never drafted
++    const bool dvocab1 = !model.dflash_selector_hidden && !model.d2t && cparams.dvocab_head != nullptr &&
++                         cparams.dvocab_head->ne[0] == output->ne[0] && cparams.dvocab_inv->ne[0] == output->ne[1];
+     if (dvocab) {
+         cur = build_hadamard_input(output, cur);
+         cur = ggml_mul_mat(ctx0, cparams.dvocab_head, cur);
++    } else if (dvocab1) {
++        cur = build_mtp_head(output, cur, output_s);
+     } else {
+         cur = build_lora_mm(output, cur, output_s);
+     }
+-- 
+2.43.0
+

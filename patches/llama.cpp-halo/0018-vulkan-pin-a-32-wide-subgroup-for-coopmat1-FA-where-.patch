@@ -1,0 +1,84 @@
+From fba3a32effb12ee6b4e6f287ad1ba9047d920cdb Mon Sep 17 00:00:00 2001
+From: Nathan Wilson <nath.flagman151@passmail.com>
+Date: Thu, 30 Jul 2026 01:25:28 +0000
+Subject: [PATCH 18/46] vulkan: pin a 32-wide subgroup for coopmat1 FA where
+ narrowing is free
+
+get_fa_tuning_params_coopmat1 took device->subgroup_size unconditionally,
+so on a 64-wide device the coopmat1 FA path always ran wave64. The
+sibling scalar path already does AMD-specific wave selection; the
+coopmat1 path never got the equivalent.
+
+Narrowing is free exactly when it does not add an iteration to the
+O-accumulation loop, which runs ceil((HSV/4) / threads_per_rowgroup) per
+row. On a 64-wide device the test reduces to hsv <= 128. Above it the
+narrow subgroup issues 1.5x to 1.8x the instructions for the same SIMD
+passes and hd256 measures 6 to 18 percent slower, so the rule declines.
+
+Gated behind GGML_VK_FA_WAVE32 (=1 rule, =2 forces the pin regardless of
+head size, diagnostic only). Off by default.
+
+Measured on gfx1151 (RADV), model-level pp2048, Qwen3-Coder-30B-A3B:
+d0 +2.5%, d8192 +8.4%, d16384 +10.1%, d32768 +11.3%. Op-level across
+head sizes, largest where wave64 wastes the most lanes: hsv=64 +12.3%,
+hsv=96 +7.4%, hsv=128 +6.5%, hsv=256 correctly declined.
+
+Full test-backend-ops suite 15884/15884 at =0, =1 and =2; the pin was
+confirmed to engage in-band via pipeline VGPR statistics rather than
+inferred from the env var being set.
+
+Assisted-by: Claude Fable 5
+(cherry picked from commit dfb619c4fe66f7602b092dbcef7b85117f9433f1)
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 33 ++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 7e9b63576..37fdcea55 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1293,8 +1293,41 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
+     result.block_cols = coopmat_block_cols * num_subgroups;
+     result.row_split = num_subgroups;
+     result.subgroup_size = device->subgroup_size;
++
++    // Pin a 32-wide subgroup only where narrowing is free. The shader derives cols_per_iter,
++    // threads_per_rowgroup and every strided load loop from gl_WorkGroupSize.x, and
++    // workgroup_size is num_subgroups * subgroup_size, so threads_per_rowgroup always equals the
++    // real subgroup size. Halving the subgroup halves the workgroup, and the per-lane O state
++    // grows as d_per_thread = ceil((HSV/4) / threads_per_rowgroup). Pin only when that count is
++    // unchanged. Above that point the narrow subgroup issues roughly 1.5x to 1.8x the
++    // instructions for the same number of SIMD passes, which loses on an issue-bound kernel:
++    // hd256 measures 6 to 18 percent slower. The test depends on HSV only; HSK does not enter
++    // d_per_thread. On a 64-wide device it reduces exactly to hsv <= 128.
++    // =1 applies the rule; =2 forces the pin regardless of head size, for measuring the
++    // configurations the rule rejects. Diagnostic only.
++    static const int fa_wave32 = [] {
++        const char * e = getenv("GGML_VK_FA_WAVE32");
++        return e ? atoi(e) : 0;
++    }();
++    if (fa_wave32 != 0 &&
++        device->subgroup_size_control &&
++        32 < device->subgroup_size &&                              // narrow only, never widen
++        device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size &&
++        (result.block_cols % 32) == 0 &&                           // cols_per_thread stays >= 1
++        (result.block_cols * result.block_rows / 4) >= num_subgroups * 32 &&  // mask_cache != 0
++        (fa_wave32 == 2 ||
++         CEIL_DIV(hsv / 4, 32u) == CEIL_DIV(hsv / 4, device->subgroup_size))) {
++        result.subgroup_size = 32;
++    }
++
+     result.workgroup_size = num_subgroups * result.subgroup_size;
+ 
++    // threads_per_rowgroup == the real subgroup size is load-bearing in three places:
++    // the subgroupMax row reduction, the subgroupAdd of Lf, and tmpsh[gl_SubgroupID], which is
++    // sized by row_split and would be written out of bounds if gl_NumSubgroups exceeded it.
++    GGML_ASSERT(result.workgroup_size == result.row_split * result.subgroup_size);
++    GGML_ASSERT(result.block_cols % result.subgroup_size == 0);
++
+     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
+     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
+ 
+-- 
+2.43.0
+

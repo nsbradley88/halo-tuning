@@ -1,0 +1,48 @@
+From 4372db4a732bc435264da3e08bfd5565fd32aff5 Mon Sep 17 00:00:00 2001
+From: nsbradley88 <3960699+nsbradley88@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 17:24:55 +0000
+Subject: [PATCH 38/46] speculative: MTP draft-vocabulary subset
+ (--spec-draft-vocab) for GLM5-Next
+
+Port of GLM patch 0017 onto q27-tune, which already has the draft-vocabulary machinery for qwen35 (8556f6c2f,
+4f3e157db: llama_set_draft_vocab, build_mtp_head with the one-row set_rows scatter): the GLM5-Next MTP graph
+now goes through build_mtp_head and llama_set_draft_vocab accepts GLM5-Next MTP contexts. Output stays exact.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp    | 4 ++--
+ src/models/glm5-next.cpp | 3 ++-
+ 2 files changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 316054746..adbd75316 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1392,8 +1392,8 @@ bool llama_context::set_draft_vocab(const llama_token * ids, int32_t n_ids) {
+     // DFlash2 drafts read the top-k of the (target's) output head through the selector: the subset head computes
+     // only the subset rows and the candidate positions map back to token ids in the graph
+     const bool is_dflash2 = model.arch == LLM_ARCH_DFLASH && model.dflash_selector_hidden != nullptr && model.d2t == nullptr;
+-    if (!is_dflash2 && (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || (model.arch != LLM_ARCH_QWEN35 && model.arch != LLM_ARCH_QWEN35MOE) || model.hparams.n_layer_nextn == 0)) {
+-        LLAMA_LOG_WARN("%s: the draft vocabulary is only supported for Qwen3.5 / Qwen3.5-MoE MTP and DFlash2 draft contexts\n", __func__);
++    if (!is_dflash2 && (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || (model.arch != LLM_ARCH_QWEN35 && model.arch != LLM_ARCH_QWEN35MOE && model.arch != LLM_ARCH_GLM5_NEXT) || model.hparams.n_layer_nextn == 0)) {
++        LLAMA_LOG_WARN("%s: the draft vocabulary is only supported for Qwen3.5 / Qwen3.5-MoE / GLM5-Next MTP and DFlash2 draft contexts\n", __func__);
+         return false;
+     }
+ 
+diff --git a/src/models/glm5-next.cpp b/src/models/glm5-next.cpp
+index 6d07faf65..2aed7f6c0 100644
+--- a/src/models/glm5-next.cpp
++++ b/src/models/glm5-next.cpp
+@@ -740,7 +740,8 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
+     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+     GGML_ASSERT(head_w && "GLM5-Next MTP: missing both nextn.shared_head_head and output");
+-    cur = build_lora_mm(head_w, cur, head_s);
++    // draft-vocabulary subset (llama_set_draft_vocab): only the subset rows of the head, -inf elsewhere
++    cur = build_mtp_head(head_w, cur, head_s);
+     cb(cur, "result_output", -1);
+ 
+     res->t_logits = cur;
+-- 
+2.43.0
+
