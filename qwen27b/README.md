@@ -77,17 +77,28 @@ Prompt processing was 31% of server time without the prompt cache, half of it av
 
 ## Talus (our HIP engine) on the same model
 
-Talus (a fork of Strata with multi-model support; not yet public) now runs this model natively. On the same file and
-harness:
+Talus (a fork of Strata with multi-model support; not yet public) now runs this model natively. Same file (UD-IQ4_XS),
+same harness, one session; all three run MTP 5 + the 64K draft vocabulary + n-gram drafting:
 
-| | llama.cpp (this page) | Talus |
-|---|---|---|
-| Chat / code / edits | **40.6 / 47.4 / 80.0** | 36.5 / 44.3 / 61.6 |
-| Decode @2K / 32K (128-token answer) | 25.8 / 34.5 | **34.2 / 35.6** |
-| Prompt @2K / 32K | 323 / 269 | **348 / 310** |
+| | **Talus** | llama.cpp (this page) | llama.cpp ([unified build](../patches/llama.cpp-halo/)) |
+|---|---|---|---|
+| Chat / code / edits | **43.6 / 51.9 / 86.5** | 40.7 / 47.9 / 80.5 | 38.4 / 47.2 / 82.6 |
+| ms per round (chat / code / edits) | **90.9 / 89.5 / 121.9** | 97.1 / 96.6 / 184.0 | 95.6 / 96.5 / 179.8 |
+| Prompt @2K / 32K | **349 / 309** | 321 / 267 | 322 / 268 |
+| Decode @2K / 32K (128-token answer) | **38.2 / 41.5** | 26.0 / 34.6 | 27.3 / 34.6 |
 
-Talus wins prompt processing and long-context decode; llama.cpp wins short-context generation. Its quality gate is in
-progress.
+Talus now wins every row. On chat and code it gets the same tokens per round as llama.cpp (3.96 vs 3.95, 4.64 vs 4.63);
+the gain is a 6–7% cheaper round. On edits it verifies shorter n-gram windows (10.5 vs 14.8 tokens per round) at two
+thirds of the cost. What made the difference: the i-quant matvecs were bound on emulated byte operations, and a native
+byte-permute table lookup cuts IQ4_XS from ~196 to ~72 instructions per 32 weights (bit-identical); a per-arch table of
+rows per wave, occupancy and column groups for each quant type and column count makes 5–16-column verify passes cheap,
+so a 16-row edit window costs ~2.0× a decode step (was 3.3×); MTP 5 instead of 4; and sampled drafts drawn from the
+sampler's min-p support (chat +8%). Quality: greedy output byte-identical to plain greedy, KL vs a CPU reference 0.0025,
+needle 15/15, agentic 5/5 (on a re-run; the first run was 4/5, one sampled repetition loop hit the output limit).
+
+The two llama.cpp builds differ on chat through numerics, not speed: their rounds cost the same (the unified build's are
+1–2% faster), but its different numerics sample a different chat text that accepts fewer drafts (3.67 vs 3.95 tokens per
+round).
 
 ## Reproduce
 
