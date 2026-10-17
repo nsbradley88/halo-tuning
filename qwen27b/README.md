@@ -98,6 +98,19 @@ so a 16-row edit window costs ~2.0× a decode step (was 3.3×); MTP 5 instead of
 sampler's min-p support (chat +8%). Quality: greedy output byte-identical to plain greedy, KL vs a CPU reference 0.0025,
 needle 15/15, agentic 5/5 (on a re-run; the first run was 4/5, one sampled repetition loop hit the output limit).
 
+**Update (adaptive draft length and a DFlash2 profile):** Talus now lengthens each MTP window while the drafter stays
+confident (3 to 7 drafts; greedy requests). It also runs z-lab's DFlash2 block-diffusion drafter as a separate code profile.
+Same session, same harness:
+
+| | Talus, DFlash2 profile | Talus, MTP (default) | llama.cpp (this page) |
+|---|---|---|---|
+| Chat / code / edits | **45.6 / 60.8** / 88.0 | 43.5 / 55.1 / **88.5** | 40.7 / 48.0 / 80.5 |
+| Decode @2K / 32K | 38.0 / 36.7 | **39.4 / 43.2** | 26.0 / 34.4 |
+
+Both are exact: greedy output is byte-identical to plain greedy, and sampled drafts are rejection-sampled. Gates pass:
+needle 15/15, agentic 5/5. The DFlash2 drafter only sees a 2048-token window and decodes slower deep into a context, so
+MTP stays the default for long agent sessions.
+
 The two llama.cpp builds differ on chat through numerics, not speed: their rounds cost the same (the unified build's are
 1–2% faster), but its different numerics sample a different chat text that accepts fewer drafts (3.67 vs 3.95 tokens per
 round).
